@@ -186,14 +186,14 @@ async def show_main_menu(message: types.Message):
     conn.close()
     
     markup = get_main_keyboard()
-    await message.answer("سلام! به پنل Swan VPN خوش آمدید.\n/start", reply_markup=markup)
+    await message.answer("سلام! به پنل Pureping VPN خوش آمدید.\n/start", reply_markup=markup)
 
 async def main_menu_handler_call(call: types.CallbackQuery, state: FSMContext):
     if await check_ban(call.message):
         return
     await state.clear()
     markup = get_main_keyboard()
-    await call.message.answer("سلام! به پنل Pureping VPN خوش آمدید.\n/start", reply_markup=markup)
+    await call.message.answer("سلام! به پنل Swan VPN خوش آمدید.\n/start", reply_markup=markup)
     try:
         await call.message.delete()
     except Exception:
