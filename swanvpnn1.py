@@ -26,10 +26,10 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
-TOKEN = "9007376692:AAGJGPvs7dJP-USYmdqo7kNAIO4CS7I32HA"
-CARD_NUMBER = "6219861493813108"
+TOKEN = "9074843069:AAExeMTZog1bGR0Lvpw0nv691w1lyIv_9Sk"
+CARD_NUMBER = "6219 8619 7137 2304"
 CARD_HOLDER = "باقرزاده"
-ADMIN_ID = 98695770
+ADMIN_ID = 8621440530
 
 class PaymentState(StatesGroup):
     waiting_for_receipt = State()
