@@ -477,6 +477,10 @@ DEFAULTS = {
     "usage_warn_percent": "80",
     "usage_sync_expiry_on": "1",
     "usage_admin_report_on": "1",
+    "usage_group_on": "1",
+    "usage_group_min": "3",
+    "usage_group_pct": "50",
+    "usage_domain_text": "⚠️ مشکل از سمت سرور است و تیم فنی در حال پیگیری است. نیازی به ارسال تیکت نیست؛ به‌محض برطرف شدن اطلاع می‌دهیم. ممنون از صبوری شما 🙏",
     "testlink_on": "1",
     # --- آموزش اتصال به تفکیک دستگاه ---
     "guide_android": "📱 آموزش اتصال در اندروید\n\n1️⃣ برنامه v2rayNG را نصب کنید.\n2️⃣ ساب‌لینک سرویس را کپی کنید.\n3️⃣ داخل برنامه روی علامت + بزنید و گزینه افزودن از کلیپ‌بورد/اشتراک (Subscription) را انتخاب کنید.\n4️⃣ سرور را انتخاب و دکمه اتصال را بزنید.",
@@ -588,6 +592,10 @@ SETTINGS = {
     "usage_warn_percent": dict(page="usage", type="num", label="هشدار وقتی مصرف رسید به (٪)", min=50, max=99),
     "usage_sync_expiry_on": dict(page="usage", type="toggle", label="همگام‌سازی تاریخ انقضا با پنل"),
     "usage_admin_report_on": dict(page="usage", type="toggle", label="گزارش لینک خراب/تموم‌شده به ادمین"),
+    "usage_group_on": dict(page="usage", type="toggle", label="گروه‌بندی هشدار لینک‌های خراب بر اساس دامنه (قطعی سرور)"),
+    "usage_group_min": dict(page="usage", type="num", label="حداقل تعداد لینک خراب یک دامنه برای هشدار گروهی", min=2, max=100),
+    "usage_group_pct": dict(page="usage", type="num", label="حداقل درصد لینک‌های خراب یک دامنه برای هشدار گروهی (٪)", min=10, max=100),
+    "usage_domain_text": dict(page="usage", type="text", label="متن پیام به کاربران سرور خراب"),
     "testlink_on": dict(page="usage", type="toggle", label="تست لینک هنگام تحویل سرویس (ادمین تصمیم می‌گیرد)"),
     # --- آموزش اتصال ---
     "guide_android": dict(page="guide", type="text", label="آموزش اندروید"),
@@ -1352,6 +1360,7 @@ def get_admin_main_keyboard(user_id=None):
         perms = staff_perms(user_id)
         optional = [
             ("users", b(text="👥 مدیریت کاربران", callback_data="admin_users")),
+            ("users", b(text="🩺 عیب‌یابی خودکار", callback_data="diag_home")),
             ("stats", b(text="📊 آمار کلی فروش", callback_data="admin_sales_stats")),
             ("plans", b(text="📦 مدیریت پلن‌ها", callback_data="admin_plans")),
             ("codes", b(text="🏷 کدهای تخفیف", callback_data="admin_codes")),
@@ -1367,6 +1376,7 @@ def get_admin_main_keyboard(user_id=None):
             [b(text="📊 آمار کلی فروش", callback_data="admin_sales_stats"), b(text="🧾 لاگ فعالیت‌ها", callback_data="admin_logs")],
             [b(text="📦 مدیریت پلن‌ها", callback_data="admin_plans"), b(text="🏷 کدهای تخفیف", callback_data="admin_codes")],
             [b(text="📢 پیام همگانی", callback_data="admin_broadcast_start"), b(text="🧰 بکاپ", callback_data="admin_backup")],
+            [b(text="🩺 عیب‌یابی خودکار", callback_data="diag_home")],
             [b(text="🎛 دکمه‌های کاربر", callback_data="ubh"), b(text="⚙️ تنظیمات ربات", callback_data="admin_settings")],
         ]
     )
@@ -3152,7 +3162,8 @@ async def admin_confirm_action(call: types.CallbackQuery, state: FSMContext):
         await state.update_data(target_user_id=uid, plan_name=plan, req_id=req_id, service_id=sid)
         await state.set_state(PaymentState.waiting_for_admin_config)
         await append_status(
-            call, "✅ درخواست تایید شد.\n⬇️ متن کانفیگ یا ساب‌لینک را برای ارسال به کاربر بفرستید:", None
+            call, "✅ درخواست تایید شد.\n⬇️ متن کانفیگ یا ساب‌لینک را برای ارسال به کاربر بفرستید.\n"
+            "📝 اگر زیر ساب‌لینک توضیحی هم بنویسید، فقط ساب‌لینک برای کاربر می‌رود و توضیح در مشخصات همین سرویس (مدیریت کاربران) فقط برای شما می‌ماند:", None
         )
         return
 
@@ -3331,7 +3342,7 @@ async def _render_user_management(target, user_id: int):
         note = user.note or ""
         referred_by = user.referred_by
         configs = [
-            (c.id, c.config_name, c.expires_at)
+            (c.id, c.config_name, c.expires_at, c.config_details)
             for c in s.query(UserConfig).filter(UserConfig.user_id == user_id).all()
         ]
 
@@ -3347,20 +3358,17 @@ async def _render_user_management(target, user_id: int):
         out += f"🔗 دعوت‌شده توسط: <code>{referred_by}</code>\n"
     if note:
         out += f"📝 یادداشت: {esc(note)}\n"
-    out += "\n📦 <b>کانفیگ‌های فعال کاربر:</b>\n"
+    out += "\n📦 <b>سرویس‌های خریداری‌شده:</b> (برای دیدن مشخصات روی هر سرویس بزن)\n"
 
     keyboard = []
-    for cfg_id, cfg_name, exp in configs:
+    for cfg_id, cfg_name, exp, _cfg_details in configs[:40]:
         exp_txt = f" - تا {jalali_from_iso(exp)}" if exp else ""
-        out += f"🔹 {esc(cfg_name or '')}{exp_txt} (ID: {cfg_id})\n"
+        out += f"🔹 {esc(cfg_name or '')}{exp_txt}\n"
         keyboard.append(
-            [
-                InlineKeyboardButton(text=f"🗑 حذف #{cfg_id}", callback_data=f"del_cfg_user_{cfg_id}_{user_id}"),
-                InlineKeyboardButton(text=f"📅 تاریخ #{cfg_id}", callback_data=f"cfgexp_{cfg_id}_{user_id}"),
-            ]
+            [InlineKeyboardButton(text=f"📦 {(cfg_name or 'سرویس')[:40]} #{cfg_id}", callback_data=f"ucfg_{cfg_id}_{user_id}")]
         )
     if not configs:
-        out += "هیچ کانفیگ فعالی ندارد.\n"
+        out += "هیچ سرویسی ندارد.\n"
 
     b = InlineKeyboardButton
     keyboard.extend(
@@ -3406,6 +3414,115 @@ async def toggle_ban_action(call: types.CallbackQuery):
     await _render_user_management(call, user_id)
 
 
+def _cfg_purchase_info(cfg_id, user_id, cfg_name):
+    """(تاریخ خرید, آخرین تمدید) از ثبت‌های ربات؛ برای سرویس‌های قدیمی از تاریخچه درخواست‌ها حدس زده می‌شود."""
+    bought = get_setting(f"cbuy_{cfg_id}") or ""
+    approx = False
+    last_renew = ""
+    with SessionLocal() as s:
+        renews = (
+            s.query(Request)
+            .filter(Request.config_id == cfg_id, Request.req_type == "renew", Request.status == "answered")
+            .order_by(Request.id.desc())
+            .all()
+        )
+        if renews:
+            last_renew = renews[0].answered_at or renews[0].created_at or ""
+        if not bought:
+            first = (
+                s.query(Request)
+                .filter(
+                    Request.user_id == user_id, Request.plan_name == cfg_name,
+                    Request.req_type.in_(["buy", "trial"]), Request.status == "answered",
+                )
+                .order_by(Request.id.asc())
+                .first()
+            )
+            if first is not None:
+                bought, approx = (first.answered_at or first.created_at or ""), True
+    return bought, approx, last_renew, len(renews) if renews else 0
+
+
+async def _render_user_config(call, cfg_id, user_id, fresh=True):
+    with SessionLocal() as s:
+        cfg = s.get(UserConfig, cfg_id)
+        if cfg is None:
+            await call.answer("این سرویس دیگه وجود نداره.", show_alert=True)
+            return
+        name, details, exp, sid = cfg.config_name, cfg.config_details, cfg.expires_at, cfg.service_id
+        svc = s.get(Service, sid) if sid else None
+        category = svc.category if svc is not None else ""
+        svc_name = svc.name if svc is not None else ""
+    bought, approx, last_renew, renew_n = _cfg_purchase_info(cfg_id, user_id, name)
+
+    out = f"📦 <b>{esc(name or svc_name or 'سرویس')}</b> (#{cfg_id})\n"
+    with SessionLocal() as s_:
+        _bu = s_.get(User, user_id)
+        _buname = esc(user_display(_bu)) if _bu is not None else ""
+    out += f"👤 خریدار: {_buname} (<code>{user_id}</code>)\n" if _buname else f"👤 کاربر: <code>{user_id}</code>\n"
+    if category or svc_name:
+        out += f"🏷 دسته/پلن: {esc(category or '')} {esc(svc_name or '')}\n".replace("  ", " ")
+    out += f"🛒 تاریخ خرید: {esc(bought) if bought else 'نامشخص'}{' (تقریبی)' if bought and approx else ''}\n"
+    if renew_n:
+        out += f"🔄 تمدید: {renew_n} بار | آخرین: {esc(last_renew)}\n"
+    if exp:
+        try:
+            left = (date.fromisoformat(exp) - today_iran()).days
+            left_txt = f" ({left} روز مانده)" if left >= 0 else f" (🔴 {abs(left)} روز گذشته)"
+        except ValueError:
+            left_txt = ""
+        out += f"📅 تاریخ انقضا: {jalali_from_iso(exp)}{left_txt}\n"
+    else:
+        out += "📅 تاریخ انقضا: ثبت نشده\n"
+
+    url = find_sub_url(details)
+    if url:
+        out += f"\n🔗 <b>ساب‌لینک:</b>\n<code>{esc(url)}</code>\n"
+        u = await fetch_usage(url, force=fresh)
+        out += "\n🩺 <b>وضعیت لینک:</b>\n"
+        if u.get("ok"):
+            out += "✅ سالم و پاسخگو\n"
+            lines = usage_lines(u)
+            out += lines if lines else "ℹ️ پنل اطلاعات حجم نداده است.\n"
+        else:
+            fails = get_int(f"ufail_{cfg_id}")
+            out += f"❌ <b>لینک خراب/بی‌پاسخ</b>: {esc(u.get('error') or '?')}\n"
+            if fails:
+                out += f"⚠️ {fails} بار پشت‌سرهم در بررسی خودکار ناموفق بوده.\n"
+            last_total = get_int(f"utotal_{cfg_id}")
+            if last_total > 0:
+                out += f"📊 آخرین حجم ثبت‌شده: {fmt_bytes(last_total)}\n"
+    else:
+        out += "\n🔗 <b>کانفیگ ارسالی:</b>\n"
+        out += f"<code>{esc((details or '').strip()[:800])}</code>\n" if details else "ثبت نشده\n"
+        out += "ℹ️ ساب‌لینک پیدا نشد، بررسی وضعیت ممکن نیست.\n"
+
+    desc = get_setting(f"cdesc_{cfg_id}").strip()
+    if desc:
+        out += f"\n📝 <b>توضیحات (فقط برای ادمین):</b>\n{esc(desc[:1200])}\n"
+
+    b = InlineKeyboardButton
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                b(text="🗑 حذف", callback_data=f"del_cfg_user_{cfg_id}_{user_id}"),
+                b(text="📅 تغییر تاریخ", callback_data=f"cfgexp_{cfg_id}_{user_id}"),
+            ],
+            [b(text="🔄 بررسی دوباره", callback_data=f"ucfg_{cfg_id}_{user_id}")],
+            [b(text="🔙 بازگشت به کاربر", callback_data=f"manage_user_{user_id}")],
+        ]
+    )
+    await edit_or_send(call, out, markup)
+
+
+@dp.callback_query(F.data.startswith("ucfg_"), Perm("users"))
+async def admin_user_config_detail(call: types.CallbackQuery, state: FSMContext):
+    await call.answer("در حال بررسی…")
+    await state.clear()
+    _, cfg_id, uid = call.data.split("_")
+    await _render_user_config(call, int(cfg_id), int(uid))
+
+
 @dp.callback_query(F.data.startswith("del_cfg_user_"), Perm("users"))
 async def delete_config_user_action(call: types.CallbackQuery):
     parts = call.data.split("_")
@@ -3415,6 +3532,8 @@ async def delete_config_user_action(call: types.CallbackQuery):
         if cfg is not None:
             s.delete(cfg)
             s.commit()
+    if get_setting(f"cdesc_{cfg_id}"):
+        set_setting(f"cdesc_{cfg_id}", "")
     log_action(call.from_user.id, f"حذف کانفیگ {cfg_id} کاربر {target_user_id}")
     await call.answer("کانفیگ کاربر حذف شد.", show_alert=True)
     try:
@@ -7479,6 +7598,38 @@ def find_sub_url(text_):
     return m.group(0).rstrip(".,;)،") if m else None
 
 
+CFG_SCHEME_RE = re.compile(r"\b(?:vless|vmess|trojan|ssr?|hysteria2?|hy2|tuic|wireguard)://", re.I)
+
+
+def split_config_text(text_):
+    """(متنی که برای کاربر می‌رود, توضیحات فقط-برای-ادمین).
+    اگر پیام ادمین یک ساب‌لینک + توضیح باشد، فقط ساب‌لینک برای کاربر می‌رود و باقی‌مانده به‌عنوان توضیح ذخیره می‌شود.
+    اگر پیام کانفیگ مستقیم (vless:// ...) یا چند لینک دارد، هیچ‌چیز جدا نمی‌شود تا چیزی از کاربر گم نشود."""
+    raw = (text_ or "").strip()
+    url = find_sub_url(raw)
+    if not url:
+        return raw, ""
+    rest = raw.replace(url, "", 1)
+    if CFG_SCHEME_RE.search(rest) or SUB_URL_RE.search(rest):
+        return raw, ""
+    rest = rest.strip(" \n\t\r-–—:،,.؛;")
+    if not rest:
+        return url, ""
+    return url, rest[:1500]
+
+
+def sub_host(url):
+    """دامنه‌ی ساب‌لینک: بخش بعد از https:// تا اولین /"""
+    try:
+        return (urlsplit(url or "").netloc or "").lower()
+    except ValueError:
+        return ""
+
+
+def host_key(host):
+    return hashlib.sha1((host or "").encode()).hexdigest()[:8]
+
+
 def parse_userinfo(raw):
     vals = {}
     for part in (raw or "").split(";"):
@@ -7660,7 +7811,426 @@ async def testsub_cmd(message: types.Message, command: CommandObject):
     await message.answer(test_report(r))
 
 
+# ---------------------------------------------------------------------------
+# 🩺 عیب‌یابی خودکار: بررسی همه‌ی ساب‌لینک‌ها و لیست لینک‌های خراب/تمام‌شده/منقضی
+# ---------------------------------------------------------------------------
+DIAG_KINDS = {
+    "bad": "❌ لینک خراب/بی‌پاسخ",
+    "fin": "🔴 حجم تمام‌شده",
+    "exp": "⏰ منقضی‌شده",
+    "warn": "⚠️ نزدیک اتمام حجم",
+}
+DIAG_PAGE = 8
+DIAG_MAX = 600
+_diag = {"ts": 0.0, "rows": {k: [] for k in DIAG_KINDS}, "total": 0, "nolink": 0, "healthy": 0, "dom": {}}
+_diag_lock = asyncio.Lock()
+
+
+async def run_diagnosis():
+    with SessionLocal() as s:
+        rows = [(c.id, c.user_id, c.config_name, c.config_details, c.expires_at) for c in s.query(UserConfig).all()]
+    today = today_iran()
+    targets, nolink = [], 0
+    for cid, uid, name, details, exp in rows:
+        url = find_sub_url(details)
+        if url:
+            targets.append((cid, uid, name, exp, url))
+        else:
+            nolink += 1
+    targets = targets[:DIAG_MAX]
+    sem = asyncio.Semaphore(5)
+
+    async def one(t):
+        async with sem:
+            return t, await fetch_usage(t[4], force=True)
+
+    results = await asyncio.gather(*(one(t) for t in targets))
+    warn_pct = get_int("usage_warn_percent") or 80
+    out = {k: [] for k in DIAG_KINDS}
+    healthy = 0
+    dom = {}
+    for (cid, uid, name, exp, _url), u in results:
+        item = (cid, uid, name or "", u.get("error") or "")
+        h = sub_host(_url)
+        if h:
+            st = dom.setdefault(h, [0, 0])
+            st[0] += 1
+            if not u["ok"]:
+                st[1] += 1
+        if not u["ok"]:
+            out["bad"].append(item)
+            continue
+        flagged = False
+        if usage_is_finished(u):
+            out["fin"].append(item)
+            flagged = True
+        elif u["has_info"] and u["total"] > 0 and u["used"] * 100 / u["total"] >= warn_pct:
+            out["warn"].append(item)
+            flagged = True
+        try:
+            if exp and date.fromisoformat(exp) < today:
+                out["exp"].append(item)
+                flagged = True
+        except ValueError:
+            pass
+        if not flagged:
+            healthy += 1
+    _diag.update(ts=time.time(), rows=out, total=len(targets), nolink=nolink, healthy=healthy, dom=dom)
+
+
+async def diag_show(call):
+    b = InlineKeyboardButton
+    d = _diag
+    when = datetime.fromtimestamp(d["ts"], iran_timezone).strftime("%H:%M")
+    txt = (
+        f"🩺 <b>عیب‌یابی خودکار لینک‌ها</b>\n"
+        f"🕒 آخرین بررسی: {when}\n\n"
+        f"🔗 لینک بررسی‌شده: {d['total']}\n"
+        f"✅ سالم: {d['healthy']}\n"
+    )
+    if d["nolink"]:
+        txt += f"➖ سرویس بدون ساب‌لینک (بررسی نشد): {d['nolink']}\n"
+    txt += "\nروی هر مورد بزنید تا لیستش را ببینید 👇"
+    kb = []
+    for k, title in DIAG_KINDS.items():
+        n = len(d["rows"][k])
+        kb.append([b(text=f"{title} ({n})", callback_data=f"diag_l_{k}_0")])
+    kb.append([b(text="🔄 بررسی دوباره", callback_data="diag_go")])
+    kb.append([b(text="🔙 بازگشت به پنل", callback_data="admin_home")])
+    await edit_or_send(call, txt, InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+@dp.callback_query(F.data.in_({"diag_home", "diag_go"}), Perm("users"))
+async def diag_start(call: types.CallbackQuery):
+    if call.data == "diag_home" and _diag["ts"] and time.time() - _diag["ts"] < 600:
+        await call.answer()
+        await diag_show(call)
+        return
+    if _diag_lock.locked():
+        await call.answer("یک بررسی در حال انجام است، چند لحظه صبر کنید.", show_alert=True)
+        return
+    await call.answer()
+    await edit_or_send(call, "⏳ دارم همه‌ی لینک‌ها را بررسی می‌کنم… ممکن است تا یک دقیقه طول بکشد.")
+    try:
+        async with _diag_lock:
+            await run_diagnosis()
+    except Exception as e:  # noqa: BLE001
+        logging.error("diagnosis failed: %s", e)
+        await edit_or_send(call, "❌ بررسی با خطا مواجه شد. دوباره تلاش کنید.")
+        return
+    await diag_show(call)
+
+
+@dp.callback_query(F.data.startswith("diag_l_"), Perm("users"))
+async def diag_list(call: types.CallbackQuery):
+    await call.answer()
+    try:
+        _, _, kind, page_s = call.data.split("_")
+        page = int(page_s)
+    except ValueError:
+        return
+    if kind not in DIAG_KINDS:
+        return
+    items = _diag["rows"][kind]
+    pages = max(1, -(-len(items) // DIAG_PAGE))
+    page = min(max(page, 0), pages - 1)
+    chunk = items[page * DIAG_PAGE : (page + 1) * DIAG_PAGE]
+    names = {}
+    if chunk:
+        with SessionLocal() as s:
+            for u in s.query(User).filter(User.user_id.in_([c[1] for c in chunk])).all():
+                names[u.user_id] = user_display(u)
+    b = InlineKeyboardButton
+    kb = []
+    for cid, uid, name, err in chunk:
+        who = names.get(uid) or str(uid)
+        label = f"#{cid} {(name or '')[:14]} · {who[:16]}"
+        kb.append([b(text=label, callback_data=f"ucfg_{cid}_{uid}")])
+    nav = []
+    if page > 0:
+        nav.append(b(text="◀️ قبلی", callback_data=f"diag_l_{kind}_{page - 1}"))
+    if page < pages - 1:
+        nav.append(b(text="بعدی ▶️", callback_data=f"diag_l_{kind}_{page + 1}"))
+    if nav:
+        kb.append(nav)
+    kb.append([b(text="🔙 خلاصه‌ی عیب‌یابی", callback_data="diag_home")])
+    head = f"{DIAG_KINDS[kind]} — {len(items)} مورد"
+    if kind == "bad" and page == 0:
+        doms = sorted(
+            ((h, t, n) for h, (t, n) in _diag.get("dom", {}).items() if n > 0), key=lambda x: (-x[2], x[0])
+        )[:6]
+        if doms:
+            head += "\n\n🌐 <b>بر اساس دامنه:</b>\n" + "\n".join(f"{esc(h)}: {n} خراب (از {t})" for h, t, n in doms)
+            dom_rows = [[b(text=f"🌐 {h[:30]} ({n}/{t})", callback_data=f"outl_{host_key(h)}_0")] for h, t, n in doms]
+            kb = dom_rows + kb
+    if items:
+        head += f"\n\n(صفحه {page + 1} از {pages})\nروی هر مورد بزنید تا مشخصات کامل را ببینید 👇"
+    else:
+        head += "\n\nموردی نیست 🎉"
+    await edit_or_send(call, head, InlineKeyboardMarkup(inline_keyboard=kb))
+
+# ---------------------------------------------------------------------------
+# بررسی دوباره‌ی یک لینک خراب + هشدار گروهی دامنه (قطعی سرور)
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data.startswith("rchk_"), Perm("users"))
+async def broken_recheck(call: types.CallbackQuery):
+    try:
+        _, cid_s, uid_s = call.data.split("_")
+        cid, uid = int(cid_s), int(uid_s)
+    except ValueError:
+        await call.answer()
+        return
+    with SessionLocal() as s:
+        cfg = s.get(UserConfig, cid)
+        if cfg is None:
+            await call.answer("این سرویس دیگه وجود نداره.", show_alert=True)
+            return
+        url, sid = find_sub_url(cfg.config_details), cfg.service_id
+    if not url:
+        await call.answer("ساب‌لینک پیدا نشد؛ بررسی ممکن نیست.", show_alert=True)
+        return
+    await call.answer("🔎 دارم دوباره بررسی می‌کنم…")
+    u = await fetch_usage(url, force=True)
+    if u["ok"]:
+        set_setting(f"ufail_{cid}", "0")
+        flags = {x for x in get_setting(f"ualert_{cid}").split(",") if x} - {"x"}
+        set_setting(f"ualert_{cid}", ",".join(sorted(flags)))
+        title = "✅ <b>لینک دوباره سالم شد</b>"
+    else:
+        title = "❌ <b>لینک هنوز خراب/بی‌پاسخ است</b>"
+    text_ = _cfg_report_block(title, cid, sid, uid, u, url)
+    text_ += f"\n🕒 بررسی مجدد: {datetime.now(iran_timezone).strftime('%H:%M:%S')}"
+    await edit_or_send(call, text_, broken_markup(cid, uid))
+
+
+def host_configs(key):
+    """همه‌ی سرویس‌هایی که ساب‌لینکشان روی این دامنه است: (host, [(cid, uid, name, sid, url)])"""
+    with SessionLocal() as s:
+        rows = [(c.id, c.user_id, c.config_name, c.service_id, c.config_details) for c in s.query(UserConfig).all()]
+    host, items = "", []
+    for cid, uid, name, sid, details in rows:
+        url = find_sub_url(details)
+        h = sub_host(url) if url else ""
+        if h and host_key(h) == key:
+            host = h
+            items.append((cid, uid, name or "", sid, url))
+    return host, items
+
+
+async def check_host_links(items, force):
+    sem = asyncio.Semaphore(5)
+
+    async def one(t):
+        async with sem:
+            return t, await fetch_usage(t[4], force=force)
+
+    return await asyncio.gather(*(one(t) for t in items))
+
+
+@dp.callback_query(F.data.startswith("outl_"), Perm("users"))
+async def outage_links(call: types.CallbackQuery):
+    try:
+        _, key, page_s = call.data.split("_")
+        page = int(page_s)
+    except ValueError:
+        await call.answer()
+        return
+    host, items = host_configs(key)
+    if not items:
+        await call.answer("این دامنه دیگه سرویسی ندارد.", show_alert=True)
+        return
+    await call.answer("در حال بررسی…")
+    res = await check_host_links(items[:DIAG_MAX], force=False)
+    bad = [t for t, u in res if not u["ok"]]
+    pages = max(1, -(-len(bad) // DIAG_PAGE))
+    page = min(max(page, 0), pages - 1)
+    chunk = bad[page * DIAG_PAGE : (page + 1) * DIAG_PAGE]
+    names = {}
+    if chunk:
+        with SessionLocal() as s:
+            for u in s.query(User).filter(User.user_id.in_([t[1] for t in chunk])).all():
+                names[u.user_id] = user_display(u)
+    b = InlineKeyboardButton
+    kb = []
+    for cid, uid, name, _sid, _url in chunk:
+        who = names.get(uid) or str(uid)
+        kb.append([b(text=f"#{cid} {name[:14]} · {who[:16]}", callback_data=f"ucfg_{cid}_{uid}")])
+    nav = []
+    if page > 0:
+        nav.append(b(text="◀️ قبلی", callback_data=f"outl_{key}_{page - 1}"))
+    if page < pages - 1:
+        nav.append(b(text="بعدی ▶️", callback_data=f"outl_{key}_{page + 1}"))
+    if nav:
+        kb.append(nav)
+    kb.append([b(text="📣 پیام به کاربران این سرور", callback_data=f"outm_{key}")])
+    kb.append([b(text="🔄 بررسی دوباره", callback_data=f"outr_{key}")])
+    kb.append([b(text="🔙 خلاصه‌ی عیب‌یابی", callback_data="diag_home")])
+    head = f"🌐 <b>{esc(host)}</b>\n{len(bad)} از {len(items)} لینک پاسخ نمی‌دهند"
+    if bad:
+        head += f" (صفحه {page + 1} از {pages})\nروی هر مورد بزنید تا مشخصات کامل را ببینید 👇"
+    else:
+        head += " 🎉"
+    await edit_or_send(call, head, InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+@dp.callback_query(F.data.startswith("outr_"), Perm("users"))
+async def outage_recheck(call: types.CallbackQuery):
+    key = call.data.split("_", 1)[1]
+    host, items = host_configs(key)
+    if not items:
+        await call.answer("این دامنه دیگه سرویسی ندارد.", show_alert=True)
+        return
+    await call.answer("🔎 دارم دوباره بررسی می‌کنم…")
+    res = await check_host_links(items[:DIAG_MAX], force=True)
+    total, bad = len(res), sum(1 for _t, u in res if not u["ok"])
+    if bad == 0:
+        set_setting(f"outd_{key}", "0")
+        text_ = f"✅ دامنه‌ی {esc(host)} دوباره سالم است ({total} از {total} لینک پاسخ می‌دهند)."
+    elif is_domain_outage(bad, total):
+        text_ = outage_alert_text(host, bad, total)
+    else:
+        text_ = f"⚠️ {bad} از {total} لینک دامنه‌ی {esc(host)} پاسخ نمی‌دهند."
+    text_ += f"\n🕒 بررسی مجدد: {datetime.now(iran_timezone).strftime('%H:%M:%S')}"
+    await edit_or_send(call, text_, outage_alert_markup(key))
+
+
+def domain_user_text():
+    return esc(get_setting("usage_domain_text").strip() or DEFAULTS["usage_domain_text"])
+
+
+@dp.callback_query(F.data.startswith("outm_"), Perm("users"))
+async def outage_msg_ask(call: types.CallbackQuery):
+    key = call.data.split("_", 1)[1]
+    host, items = host_configs(key)
+    users = {t[1] for t in items}
+    if not users:
+        await call.answer("کاربری روی این دامنه نیست.", show_alert=True)
+        return
+    await call.answer()
+    out = (
+        f"📣 پیام زیر برای <b>{len(users)}</b> کاربرِ دامنه‌ی <b>{esc(host)}</b> ارسال می‌شود:\n\n"
+        f"{domain_user_text()}"
+    )
+    last = get_int(f"outmsg_{key}")
+    if last and time.time() - last < 1800:
+        out += f"\n\n⚠️ {int((time.time() - last) // 60)} دقیقه پیش همین پیام برای این دامنه ارسال شده."
+    b = InlineKeyboardButton
+    kb = [
+        [b(text="✅ ارسال", callback_data=f"outmy_{key}")],
+        [b(text="❌ انصراف", callback_data=f"outl_{key}_0")],
+    ]
+    await edit_or_send(call, out, InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+@dp.callback_query(F.data.startswith("outmy_"), Perm("users"))
+async def outage_msg_send(call: types.CallbackQuery):
+    key = call.data.split("_", 1)[1]
+    host, items = host_configs(key)
+    users = sorted({t[1] for t in items})
+    if not users:
+        await call.answer("کاربری روی این دامنه نیست.", show_alert=True)
+        return
+    last = get_int(f"outmsg_{key}")
+    if last and time.time() - last < 60:
+        await call.answer("همین الان ارسال شد.", show_alert=True)
+        return
+    set_setting(f"outmsg_{key}", str(int(time.time())))
+    await call.answer("ارسال شروع شد…")
+    await edit_or_send(call, f"⏳ در حال ارسال پیام برای {len(users)} کاربر…")
+    text_ = domain_user_text()
+    sent = failed = 0
+    for uid in users:
+        try:
+            await send_message_retry(call.bot, uid, text_)
+            sent += 1
+        except Exception:  # noqa: BLE001
+            failed += 1
+        await asyncio.sleep(0.05)
+    log_action(call.from_user.id, f"پیام قطعی دامنه {host} برای {sent} کاربر")
+    b = InlineKeyboardButton
+    await edit_or_send(
+        call,
+        f"✅ پیام برای {sent} کاربر دامنه‌ی {esc(host)} ارسال شد." + (f"\n⚠️ {failed} مورد ناموفق (ربات را بلاک کرده‌اند)." if failed else ""),
+        InlineKeyboardMarkup(inline_keyboard=[[b(text="🔙 خلاصه‌ی عیب‌یابی", callback_data="diag_home")]]),
+    )
+
+
+
 _usage_job_running = False
+
+
+def outage_alert_text(host, bad, total):
+    return f"🚨 <b>احتمالاً سرور {esc(host)} قطع است</b>\n{bad} از {total} لینک این دامنه پاسخ نمی‌دهند."
+
+
+def outage_alert_markup(key):
+    b = InlineKeyboardButton
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                b(text="👁 مشاهده‌ی لینک‌ها", callback_data=f"outl_{key}_0"),
+                b(text="📣 پیام به کاربران این سرور", callback_data=f"outm_{key}"),
+            ],
+            [b(text="🔄 بررسی دوباره", callback_data=f"outr_{key}")],
+        ]
+    )
+
+
+def is_domain_outage(bad, total):
+    gmin = max(2, get_int("usage_group_min") or 3)
+    gpct = get_int("usage_group_pct") or 50
+    return total > 0 and bad >= gmin and bad * 100 >= gpct * total
+
+
+def broken_markup(cid, uid):
+    b = InlineKeyboardButton
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [b(text="📦 مشخصات کامل سرویس", callback_data=f"ucfg_{cid}_{uid}")],
+            [b(text="🔄 بررسی دوباره", callback_data=f"rchk_{cid}_{uid}")],
+        ]
+    )
+
+
+def _cfg_report_block(title, cid, sid, uid, u=None, url=None):
+    """بلوک کامل گزارش ادمین: کاربر، پلن، تاریخ خرید/انقضا، حجم، وضعیت و ساب‌لینک."""
+    lines = [title]
+    name = exp = ""
+    user_txt = f"<code>{uid}</code>"
+    plan = ""
+    try:
+        with SessionLocal() as s:
+            cfg = s.get(UserConfig, cid)
+            svc = s.get(Service, sid) if sid else None
+            usr = s.get(User, uid)
+            if cfg is not None:
+                name, exp = cfg.config_name or "", cfg.expires_at or ""
+            if svc is not None:
+                plan = f"{svc.category or ''} {svc.name or ''}".strip()
+            if usr is not None:
+                user_txt = f"{esc(user_display(usr))} (<code>{uid}</code>)"
+    except Exception:  # noqa: BLE001
+        pass
+    lines.append(f"👤 کاربر: {user_txt}")
+    lines.append(f"📦 سرویس: {esc(name or plan or '-')} (#{cid})")
+    if plan and plan != name:
+        lines.append(f"🏷 پلن: {esc(plan)}")
+    try:
+        bought, approx, _lr, _rn = _cfg_purchase_info(cid, uid, name)
+    except Exception:  # noqa: BLE001
+        bought, approx = "", False
+    if bought:
+        lines.append(f"🛒 تاریخ خرید: {esc(bought)}{' (تقریبی)' if approx else ''}")
+    if exp:
+        lines.append(f"📅 انقضا: {jalali_from_iso(exp)}")
+    total = int(u["total"]) if u and u.get("ok") and u.get("total") else get_int(f"utotal_{cid}")
+    if total > 0:
+        lines.append(f"📊 حجم: {fmt_bytes(total)}")
+    if u is not None and not u.get("ok"):
+        lines.append(f"⚠️ خطا: {esc(u.get('error') or '?')}")
+    if url:
+        lines.append(f"🔗 <code>{esc(url)}</code>")
+    return "\n".join(lines)
 
 
 async def job_usage_alerts(bot):
@@ -7701,7 +8271,14 @@ async def job_usage_alerts(bot):
         report_on = get_bool("usage_admin_report_on")
         sync_on = get_bool("usage_sync_expiry_on")
         broken, finished = [], []
+        dom = {}
         for (cid, uid, name, sid, _url), u in results:
+            _h = sub_host(_url)
+            if _h:
+                _st = dom.setdefault(_h, [0, 0])
+                _st[0] += 1
+                if not u["ok"]:
+                    _st[1] += 1
             prev = {x for x in get_setting(f"ualert_{cid}").split(",") if x}
             flags = set()
             if not u["ok"]:
@@ -7716,6 +8293,8 @@ async def job_usage_alerts(bot):
                 if sync_on and u["has_info"]:
                     sync_real_expiry(cid, u)
                 if u["has_info"] and u["total"] > 0:
+                    set_setting(f"utotal_{cid}", str(int(u["total"])))
+                if u["has_info"] and u["total"] > 0:
                     pct = u["used"] * 100 / u["total"]
                     if pct >= 100:
                         flags |= {"w", "f"}
@@ -7726,9 +8305,9 @@ async def job_usage_alerts(bot):
                 set_setting(f"ualert_{cid}", ",".join(sorted(flags)))
             if report_on:
                 if "x" in new:
-                    broken.append(f"❌ #{cid} | {esc(name or '')} | <code>{uid}</code> | {esc(u.get('error') or '?')}")
+                    broken.append((cid, uid, _cfg_report_block("❌ <b>لینک خراب/بی‌پاسخ</b>", cid, sid, uid, u, _url), _h))
                 if "f" in new:
-                    finished.append(f"🔴 #{cid} | {esc(name or '')} | <code>{uid}</code>")
+                    finished.append(_cfg_report_block("🔴 <b>حجم تموم شد</b>", cid, sid, uid, u, _url))
             if alerts_on and ("f" in new or "w" in new):
                 if "f" in new:
                     msg = f"🔴 حجم سرویس «{esc(name or '')}» تموم شد. برای ادامه تمدیدش کن 👇"
@@ -7747,13 +8326,34 @@ async def job_usage_alerts(bot):
                 except Exception as e:  # noqa: BLE001
                     logging.info("usage alert to %s failed: %s", uid, e)
                 await asyncio.sleep(0.05)
+        if report_on and get_bool("usage_group_on"):
+            down_hosts = set()
+            for host, (tot, bad) in dom.items():
+                key = host_key(host)
+                was_down = get_bool(f"outd_{key}")
+                if is_domain_outage(bad, tot):
+                    down_hosts.add(host)
+                    if not was_down:
+                        set_setting(f"outd_{key}", "1")
+                        await notify_staff(bot, outage_alert_text(host, bad, tot), outage_alert_markup(key))
+                elif was_down:
+                    set_setting(f"outd_{key}", "0")
+                    await notify_staff(bot, f"✅ دامنه‌ی {esc(host)} دوباره پاسخ می‌دهد ({tot - bad} از {tot} لینک سالم).")
+            broken = [x for x in broken if x[3] not in down_hosts]  # به‌جای ده‌ها هشدار جدا، یک هشدار گروهی
         if broken or finished:
-            out = "🚨 <b>گزارش لینک سرویس‌ها</b>\n"
-            if broken:
-                out += "\n<b>لینک خراب/بی‌پاسخ:</b>\n" + "\n".join(broken[:25]) + "\n"
-            if finished:
-                out += "\n<b>حجم تموم‌شده:</b>\n" + "\n".join(finished[:25]) + "\n"
-            await notify_staff(bot, out)
+            await notify_staff(bot, "🚨 <b>گزارش لینک سرویس‌ها</b>")
+            for cid, uid, text_, _hh in broken[:15]:
+                await notify_staff(bot, text_, broken_markup(cid, uid))
+            if len(broken) > 15:
+                await notify_staff(bot, f"… و {len(broken) - 15} لینک خراب دیگر (در پنل کاربران ببینید).")
+            chunk = ""
+            for blk in finished[:25]:
+                if chunk and len(chunk) + len(blk) + 2 > 3600:
+                    await notify_staff(bot, chunk)
+                    chunk = ""
+                chunk += ("\n\n" if chunk else "") + blk
+            if chunk:
+                await notify_staff(bot, chunk)
     except Exception as e:  # noqa: BLE001
         logging.error("usage alerts failed: %s", e)
     finally:
@@ -7770,6 +8370,7 @@ async def _finish_config_delivery(bot, chat_id, admin_id, state, config_text, no
     plan_name = data.get("plan_name")
     service_id = data.get("service_id")
     start_date = today_iran()
+    config_text, admin_desc = split_config_text(config_text)  # توضیحات ادمین به کاربر نمی‌رسد
 
     with SessionLocal() as s:
         r = s.get(Request, req_id) if req_id else None
@@ -7783,20 +8384,28 @@ async def _finish_config_delivery(bot, chat_id, admin_id, state, config_text, no
         end_date = start_date + timedelta(days=days)
         r.status = "answered"
         r.answered_at = get_current_jalali()
-        s.add(
-            UserConfig(
-                user_id=target_user_id, config_name=plan_name, config_details=config_text,
-                service_id=service_id, expires_at=end_date.isoformat(), reminded=False,
-            )
+        new_cfg = UserConfig(
+            user_id=target_user_id, config_name=plan_name, config_details=config_text,
+            service_id=service_id, expires_at=end_date.isoformat(), reminded=False,
         )
+        s.add(new_cfg)
+        s.flush()
+        new_cfg_id = new_cfg.id
         monthly_notif, reward = (None, None) if is_trial else register_purchase(s, target_user_id, r.price or 0)
         s.commit()
+    try:
+        set_setting(f"cbuy_{new_cfg_id}", get_current_jalali())
+        if admin_desc:
+            set_setting(f"cdesc_{new_cfg_id}", admin_desc)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("save purchase date failed: %s", e)
 
     await state.clear()
     log_action(admin_id, f"ارسال کانفیگ برای درخواست #{req_id}")
     await bot.send_message(
         chat_id=chat_id,
-        text=f"✅ کانفیگ با موفقیت برای کاربر {target_user_id} ارسال و ثبت شد.{note}",
+        text=f"✅ کانفیگ با موفقیت برای کاربر {target_user_id} ارسال و ثبت شد.{note}"
+        + ("\n📝 توضیحات شما فقط در مشخصات سرویس (مدیریت کاربران) ذخیره شد و برای کاربر ارسال نشد." if admin_desc else ""),
         reply_markup=get_admin_main_keyboard(admin_id),
     )
 
