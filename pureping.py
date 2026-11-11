@@ -195,6 +195,8 @@ class User(Base):
     src = Column(String)  # منبع جذب (/start src_xxx)
     promo_off = Column(Boolean, default=False)
     blocked = Column(Boolean, default=False)
+    last_seen_iso = Column(String)  # آخرین بازدید (YYYY-MM-DDTHH:MM) برای پیام «خوش برگشتی»
+    active_hour = Column(Integer)  # ساعت معمول فعالیت کاربر (۰ تا ۲۳) برای ارسال هوشمند
 
 
 class Service(Base):
@@ -278,6 +280,7 @@ class TicketMessage(Base):
     sender = Column(String)  # user | staff
     text = Column(Text)
     photo_id = Column(String)
+    voice_id = Column(String)  # ویس پشتیبانی (file_id تلگرام)
     created_at = Column(String)
 
 
@@ -296,6 +299,57 @@ class Rating(Base):
     request_id = Column(Integer)
     score = Column(Integer)
     created_at = Column(String)
+    comment = Column(Text)  # متن نظر (اختیاری، با رضایت کاربر)
+    approved = Column(Boolean, default=False)  # تأیید ادمین برای نمایش عمومی
+
+
+class WalletTx(Base):
+    """دفتر کل کیف پول: هر تغییر موجودی یک ردیف با مقدار قبل و بعد."""
+
+    __tablename__ = "wallet_tx"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger)
+    delta = Column(Integer)
+    before = Column(Integer)
+    after = Column(Integer)
+    reason = Column(String)
+    ref = Column(String)
+    by = Column(BigInteger)  # ادمین/کاربر تأییدکننده (در صورت وجود)
+    created_iso = Column(String)
+
+
+class OutageLog(Base):
+    """تاریخچه قطعی‌ها برای صفحهٔ وضعیت."""
+
+    __tablename__ = "outage_log"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    started_iso = Column(String)
+    ended_iso = Column(String)
+    note = Column(String)
+
+
+class SettingVersion(Base):
+    """نسخهٔ قبلی متن‌های قابل ویرایش، برای بازگردانی."""
+
+    __tablename__ = "setting_versions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(String)
+    value = Column(Text)
+    created_iso = Column(String)
+    by = Column(BigInteger)
+
+
+class SmartBroadcast(Base):
+    """پیام همگانی هوشمند: هر کاربر در ساعت معمول فعالیت خودش دریافت می‌کند."""
+
+    __tablename__ = "smart_broadcasts"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    from_chat = Column(BigInteger)
+    message_id = Column(Integer)
+    seg = Column(String)
+    created_iso = Column(String)
+    status = Column(String, default="active")
+    admin_id = Column(BigInteger)
 
 
 class ReceiptHash(Base):
@@ -574,7 +628,7 @@ SETTINGS = {
     "force_join_channel": dict(page="join", type="text", label="کانال (@username یا آیدی عددی -100...؛ ربات باید ادمین کانال باشد)"),
     "force_join_text": dict(page="join", type="text", label="متن درخواست عضویت"),
     # --- بکاپ، گزارش، نگهداری، خطا ---
-    "backup_channel": dict(page="auto", type="text", label="کانال خصوصی بکاپ (@username یا -100...؛ ربات باید ادمین باشد)"),
+    "backup_channel": dict(page="auto", type="text", label="کانال بکاپ (@username، -100... یا یک پیام فورواردشده از کانال خصوصی؛ ربات باید ادمین باشد)"),
     "weekly_report_on": dict(page="auto", type="toggle", label="گزارش هفتگی خودکار (شنبه‌ها)"),
     "cleanup_on": dict(page="auto", type="toggle", label="پاکسازی خودکار آمار و لاگ قدیمی"),
     "log_keep_days": dict(page="auto", type="num", label="نگهداری لاگ و تیکت بسته (روز)", min=7, max=3650),
@@ -763,6 +817,15 @@ def _migrate_columns():
             "src": "VARCHAR",
             "promo_off": "BOOLEAN DEFAULT FALSE",
             "blocked": "BOOLEAN DEFAULT FALSE",
+            "last_seen_iso": "VARCHAR",
+            "active_hour": "INTEGER",
+        },
+        "ratings": {
+            "comment": "TEXT",
+            "approved": "BOOLEAN DEFAULT FALSE",
+        },
+        "cart_events": {
+            "step": "VARCHAR",
         },
         "user_configs": {
             "service_id": "INTEGER",
@@ -783,6 +846,9 @@ def _migrate_columns():
             "custom_days": "INTEGER",
             "pay_amount": "INTEGER",
         },
+        "ticket_messages": {
+            "voice_id": "VARCHAR",
+        },
     }
     insp = inspect(engine)
     with engine.begin() as conn:
@@ -801,6 +867,7 @@ def _migrate_columns():
         ("ix_receipt_hashes_sha256", "receipt_hashes", "sha256"),
         ("ix_receipt_hashes_unique_id", "receipt_hashes", "unique_id"),
         ("ix_ticket_messages_ticket_id", "ticket_messages", "ticket_id"),
+        ("ix_wallet_tx_user_id", "wallet_tx", "user_id"),
     )
     for name, table, cols in indexes:
         try:
@@ -1248,13 +1315,28 @@ async def send_sticker(bot, chat_id, key):
 
 
 async def relay(bot, chat_id, message: types.Message, header, markup=None):
-    """متن یا عکس پیام را با یک سرتیتر برای chat_id می‌فرستد."""
-    body = message.caption if message.photo else message.text
+    """متن، عکس یا ویس پیام را با یک سرتیتر برای chat_id می‌فرستد."""
+    body = message.caption if (message.photo or message.voice) else message.text
     full = f"{header}{esc(body or '')}"
-    if message.photo:
+    if message.voice:
+        await bot.send_voice(chat_id=chat_id, voice=message.voice.file_id, caption=full[:1024], reply_markup=markup)
+    elif message.photo:
         await bot.send_photo(chat_id=chat_id, photo=message.photo[-1].file_id, caption=full, reply_markup=markup)
     else:
         await bot.send_message(chat_id=chat_id, text=full, reply_markup=markup)
+
+
+VOICE_MAX_SECONDS = 180  # حداکثر مدت ویس پشتیبانی
+
+
+def voice_problem(message: types.Message):
+    """اگر ویس نامعتبر/خیلی طولانی بود متن خطا، وگرنه None."""
+    v = message.voice
+    if v is None:
+        return None
+    if (v.duration or 0) > VOICE_MAX_SECONDS:
+        return f"🎤 ویس خیلی طولانی است (حداکثر {VOICE_MAX_SECONDS // 60} دقیقه). لطفاً کوتاه‌تر بفرستید."
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1280,7 +1362,7 @@ def iso_now_minute():
 
 
 def pending_notice():
-    return esc(get_setting("pending_text").strip() or DEFAULTS["pending_text"])
+    return esc(get_setting("pending_text").strip() or DEFAULTS["pending_text"]) + pending_extra()
 
 
 def status_markup(req_id):
@@ -1414,6 +1496,11 @@ def touch_user(tg_user):
             u.username = tg_user.username
             u.first_name = tg_user.first_name
             u.blocked = False
+            if not created:
+                v3_touch(u)
+            else:
+                u.last_seen_iso = now_naive().strftime(TS_FMT)
+                u.active_hour = now_naive().hour
             s.commit()
         if len(_user_seen) > 5000:
             _user_seen.clear()
@@ -1562,6 +1649,7 @@ def build_welcome(user_id, first_name):
         else:
             body += f"\n⚠️ سرویس «{esc(cname or '')}» منقضی شده است."
 
+    body += v3_welcome_extras(user_id, is_new)
     body += "\n\nبرای برگشت به منوی اصلی /start رو بزن."
     return body
 
@@ -1792,7 +1880,7 @@ def checkout_view(co, balance=0):
         ]
     )
     rows.append([b(text="⬅️ انصراف و بازگشت", callback_data="main_buy")])
-    return out, InlineKeyboardMarkup(inline_keyboard=rows)
+    return out + trust_footer(), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def send_checkout(target, state, user_id):
@@ -1805,6 +1893,7 @@ async def send_checkout(target, state, user_id):
     with SessionLocal() as s:
         u = s.get(User, user_id)
         balance = (u.balance if u else 0) or 0
+    fstep(user_id, "checkout")
     out, markup = checkout_view(co, balance)
     await reply_to(target, out, markup)
 
@@ -1871,6 +1960,7 @@ async def buy_plan_handler(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(PaymentState.waiting_for_receipt)
     await state.update_data(service_id=service_id, renew_cfg_id=None, code=None)
+    fstep(call.from_user.id, "plan")
     await send_checkout(call, state, call.from_user.id)
 
 
@@ -2005,6 +2095,7 @@ async def pay_with_wallet_handler(call: types.CallbackQuery, state: FSMContext):
             await call.answer(str(e), show_alert=True)
             return
         user.balance = balance - co["final"]
+        wlog(s, user_id, balance, user.balance, "wallet_purchase", req.id)
         req_id, req_type = req.id, req.req_type
         s.commit()
 
@@ -2030,18 +2121,26 @@ async def confirm_payment_handler(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(PaymentState.waiting_for_receipt)
     amount = await ensure_pay_amount(state, co["final"])
     record_cart(call.from_user.id, co["label"], co["final"])
+    fstep(call.from_user.id, "pay")
+    card_no, card_holder = pick_card(call.from_user.id)
     out = (
         "<b>مرحله ۳ از ۳ | واریز و ارسال رسید</b>\n\n"
         f"📦 {esc(co['label'])}\n💰 مبلغ قابل پرداخت: <b>{amount:,}</b> تومان\n"
         + pay_note(co["final"], amount)
         + "\n"
-        f"💳 شماره کارت:\n<code>{esc(pick_card(call.from_user.id)[0])}</code>\n"
-        f"به نام: {esc(pick_card(call.from_user.id)[1])}\n\n"
-        "بعد از واریز، <b>عکس رسیدت</b> رو همینجا بفرست 📸\n⏱ بعد از ارسال رسید، معمولاً ظرف ۳۰ دقیقه آماده می‌شه."
+        f"💳 شماره کارت:\n<code>{esc(card_no)}</code>\n"
+        + v3_pay_holder_line(card_holder)
+        + "\n\n"
+        "بعد از واریز، <b>عکس رسیدت</b> رو همینجا بفرست 📸\n"
+        + eta_line()
+        + night_notice()
+        + trust_footer()
     )
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ بازگشت به پرداخت", callback_data="checkout_back")]]
-    )
+    rows = []
+    if get_bool("payhelp_on"):
+        rows.append([InlineKeyboardButton(text="❓ سؤال دارم", callback_data=CB.PAYHELP)])
+    rows.append([InlineKeyboardButton(text="⬅️ بازگشت به پرداخت", callback_data="checkout_back")])
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
     await edit_or_send(call, out, markup)
 
 
@@ -2186,6 +2285,7 @@ async def receipt_handler(message: types.Message, state: FSMContext):
         return
 
     await state.clear()
+    fstep(user_id, "receipt")
     await message.answer(
         fill_text("t_receipt_ok", date=get_current_jalali()) + "\n\n" + pending_notice(),
         reply_markup=status_markup(req_id),
@@ -2218,6 +2318,9 @@ async def receipt_router(message: types.Message, state: FSMContext):
     )
     if message.text and message.text in MENU_TEXTS:
         raise SkipHandler()
+    if message.text and cur == PaymentState.waiting_for_receipt.state and (await state.get_data()).get("payhelp"):
+        await v3_payhelp_question(message, state)
+        return
     if has_receipt_media(message):
         async with user_lock(message.from_user.id):
             cur = await state.get_state()
@@ -2713,6 +2816,7 @@ def support_view():
     if support:
         out += f"برای ارتباط مستقیم با ادمین به آیدی زیر پیام دهید:\n👉 {esc(support)}\n\n"
     out += "یا از دکمه زیر تیکت بفرستید تا همین‌جا جواب بگیرید."
+    out += support_extra()
     markup = InlineKeyboardMarkup(inline_keyboard=ub_build_rows("support"))
     return out, markup
 
@@ -2761,7 +2865,7 @@ async def ticket_new(call: types.CallbackQuery, state: FSMContext):
         return
     await state.set_state(PaymentState.ticket_waiting_text)
     await state.update_data(ticket_id=None)
-    await edit_or_send(call, "✍️ پیام یا مشکل خود را بنویسید (می‌توانید عکس هم بفرستید):")
+    await edit_or_send(call, "✍️ پیام یا مشکل خود را بنویسید (عکس و 🎤 ویس هم می‌توانید بفرستید):")
 
 
 @dp.callback_query(F.data.startswith("ticket_ureply_"))
@@ -2774,7 +2878,7 @@ async def ticket_user_reply(call: types.CallbackQuery, state: FSMContext):
             return
     await state.set_state(PaymentState.ticket_waiting_text)
     await state.update_data(ticket_id=tid)
-    await call.message.answer(f"✍️ پاسخ شما برای تیکت #{tid} را بنویسید:")
+    await call.message.answer(f"✍️ پاسخ شما برای تیکت #{tid} را بنویسید (متن، عکس یا 🎤 ویس):")
 
 
 _ticket_times = {}  # user_id -> [زمان ساخت تیکت‌های جدید]
@@ -2783,9 +2887,15 @@ TICKET_MAX_PER_HOUR = 5
 
 @dp.message(PaymentState.ticket_waiting_text, ~F.text.in_(MENU_TEXTS))
 async def ticket_text_received(message: types.Message, state: FSMContext):
-    body = message.caption if message.photo else message.text
-    if not body and not message.photo:
-        await message.answer("لطفاً متن یا عکس بفرستید.")
+    body = message.caption if (message.photo or message.voice) else message.text
+    if not body and not message.photo and not message.voice:
+        await message.answer("لطفاً متن، عکس یا ویس بفرستید.")
+        return
+    problem = voice_problem(message)
+    if problem:
+        await message.answer(problem)
+        return
+    if not is_staff(message.from_user.id) and await v3_triage_intercept(message, state):
         return
     data = await state.get_data()
     tid = data.get("ticket_id")
@@ -2801,6 +2911,7 @@ async def ticket_text_received(message: types.Message, state: FSMContext):
         if len(_ticket_times) > 5000:
             _ticket_times.clear()
     photo_id = message.photo[-1].file_id if message.photo else None
+    voice_id = message.voice.file_id if message.voice else None
     with SessionLocal() as s:
         if tid:
             t = s.get(Ticket, tid)
@@ -2813,7 +2924,7 @@ async def ticket_text_received(message: types.Message, state: FSMContext):
             s.add(t)
             s.flush()
             tid = t.id
-        s.add(TicketMessage(ticket_id=tid, sender="user", text=body or "", photo_id=photo_id, created_at=get_current_jalali()))
+        s.add(TicketMessage(ticket_id=tid, sender="user", text=body or "", photo_id=photo_id, voice_id=voice_id, created_at=get_current_jalali()))
         s.commit()
 
     await state.clear()
@@ -2827,6 +2938,7 @@ async def ticket_text_received(message: types.Message, state: FSMContext):
                 b(text="✅ بستن تیکت", callback_data=f"ticket_close_{tid}"),
             ]
         ]
+        + canned_rows(tid)
     )
     header = f"🎫 تیکت #{tid} از {user_label(message.from_user)} ({message.from_user.id}):\n\n"
     for cid in staff_ids():
@@ -3001,11 +3113,15 @@ def register_purchase(s, user_id, price=0):
         if ref is not None and (amount > 0 or get_bool("ref_tiers_on")):
             user.referral_rewarded = True
             hits = referral_tier_hits(s, ref.user_id)
-            ref.balance = (ref.balance or 0) + amount + sum(a for _n, a in hits)
+            _b0 = ref.balance or 0
+            ref.balance = _b0 + amount + sum(a for _n, a in hits)
+            wlog(s, ref.user_id, _b0, ref.balance, "referral_reward", user_id)
             reward = (ref.user_id, amount, hits)
             inv = get_int("ref_invitee_reward")
             if inv > 0:
-                user.balance = min(MAX_BALANCE, (user.balance or 0) + inv)
+                _b1 = user.balance or 0
+                user.balance = min(MAX_BALANCE, _b1 + inv)
+                wlog(s, user_id, _b1, user.balance, "invitee_reward", ref.user_id)
                 _INVITEE_NOTICE[user_id] = inv
     return monthly_notif, reward
 
@@ -3106,6 +3222,8 @@ async def rating_handler(call: types.CallbackQuery):
                 await call.bot.send_message(chat_id=cid, text=text_, reply_markup=markup_admin)
             except Exception as e:  # noqa: BLE001
                 logging.warning("low rating notify failed for %s: %s", cid, e)
+    elif get_bool("reviews_on") and score >= 4:
+        await v3_ask_review(call, req_id, score)
     else:
         await edit_or_send(call, f"🙏 ممنون از امتیاز شما ({score} ⭐)!")
 
@@ -3127,7 +3245,9 @@ async def admin_confirm_action(call: types.CallbackQuery, state: FSMContext):
         if rtype == "charge":
             user = get_or_create_user(s, uid)
             bonus, bonus_pct = charge_bonus_for(price)
-            user.balance = (user.balance or 0) + price + bonus
+            _b0 = user.balance or 0
+            user.balance = _b0 + price + bonus
+            wlog(s, uid, _b0, user.balance, "charge_confirmed", req_id, call.from_user.id)
             r.status = "answered"
             r.answered_at = get_current_jalali()
             s.commit()
@@ -3152,6 +3272,17 @@ async def admin_confirm_action(call: types.CallbackQuery, state: FSMContext):
             s.commit()
             set_setting(f"renewhold_{cfg_id_for_hold}", (today_iran() + timedelta(days=3)).isoformat())
             result = ("renew", uid, plan, new_exp.isoformat(), (monthly_notif, reward))
+        elif rtype == "addon":
+            cfg = s.get(UserConfig, r.config_id) if r.config_id else None
+            if cfg is None:
+                await call.answer("سرویس مربوط به این افزونه پیدا نشد. درخواست را رد کنید.", show_alert=True)
+                return
+            info = v3_apply_addon(cfg, plan)
+            r.status = "answered"
+            r.answered_at = get_current_jalali()
+            monthly_notif, reward = register_purchase(s, uid, price)
+            s.commit()
+            result = ("addon", uid, plan, info, (monthly_notif, reward))
         else:
             sid = r.service_id
 
@@ -3180,6 +3311,8 @@ async def admin_confirm_action(call: types.CallbackQuery, state: FSMContext):
             await send_sticker(call.bot, uid, "sticker_charge")
         except Exception as e:  # noqa: BLE001
             logging.error("notify charge failed: %s", e)
+    elif kind == "addon":
+        await v3_addon_confirmed(call, uid, a, b_, extra, markup, req_id)
     else:
         await append_status(call, "✅ وضعیت: تمدید انجام شد.", markup)
         try:
@@ -3191,7 +3324,11 @@ async def admin_confirm_action(call: types.CallbackQuery, state: FSMContext):
         except Exception as e:  # noqa: BLE001
             logging.error("notify renew failed: %s", e)
         await post_purchase_notifications(call.bot, uid, extra[0], extra[1])
-        await send_rating_request(call.bot, uid, req_id)
+        await v3_post_delivery(call.bot, uid, req_id)
+        try:
+            await v3_upsell(call.bot, uid, req_id)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("upsell failed: %s", e)
 
 
 @dp.callback_query(F.data.startswith("admin_reject_"), Staff())
@@ -3211,7 +3348,9 @@ async def admin_reject_action(call: types.CallbackQuery):
         target_user = r.user_id
         if r.paid_wallet and (r.price or 0) > 0:
             user = get_or_create_user(s, target_user)
-            user.balance = (user.balance or 0) + r.price
+            _b0 = user.balance or 0
+            user.balance = _b0 + r.price
+            wlog(s, target_user, _b0, user.balance, "refund_rejected", req_id, call.from_user.id)
             refunded = r.price
         release_code(s, r.discount_code, target_user)
         if r.req_type == "trial":
@@ -3381,6 +3520,7 @@ async def _render_user_management(target, user_id: int):
                 b(text="📝 یادداشت", callback_data=f"note_{user_id}"),
                 b(text="📜 تاریخچه", callback_data=f"uhist_{user_id}"),
             ],
+            [b(text="📒 دفتر کل کیف پول", callback_data=f"{CB.WL}{user_id}")],
             [
                 b(
                     text="🔓 آزاد سازی کاربر" if banned else "🚫 مسدود کردن (بن) کاربر",
@@ -3682,6 +3822,7 @@ async def process_balance_adjustment(message: types.Message, state: FSMContext):
         else:
             new_balance = amount
         user.balance = new_balance
+        wlog(s, uid, current, new_balance, "admin_adjust", mode, message.from_user.id)
         s.commit()
 
     await state.clear()
@@ -4379,22 +4520,29 @@ async def admin_ticket_view(call: types.CallbackQuery):
             return
         uid, status = t.user_id, t.status
         msgs = [
-            (m.sender, m.text, m.photo_id, m.created_at)
+            (m.sender, m.text, m.photo_id, m.created_at, m.voice_id)
             for m in s.query(TicketMessage).filter(TicketMessage.ticket_id == tid).order_by(TicketMessage.id.desc()).limit(8).all()
         ]
     msgs.reverse()
     out = f"🎫 <b>تیکت #{tid}</b> | کاربر <code>{uid}</code> | {'باز' if status == 'open' else 'بسته'}\n\n"
-    for sender, body, photo, created in msgs:
+    voices = [v for _s, _b, _p, _c, v in msgs if v][-3:]
+    for sender, body, photo, created, voice in msgs:
         who = "👤 کاربر" if sender == "user" else "🎧 پشتیبان"
-        out += f"{who} ({created}):\n{esc(body or '')}{' 📷' if photo else ''}\n\n"
+        out += f"{who} ({created}):\n{esc(body or '')}{' 📷' if photo else ''}{' 🎤 ویس' if voice else ''}\n\n"
     b = InlineKeyboardButton
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
             [b(text="💬 پاسخ", callback_data=f"ticket_reply_{tid}"), b(text="✅ بستن", callback_data=f"ticket_close_{tid}")],
-            [b(text="🔙 لیست تیکت‌ها", callback_data="admin_tickets")],
         ]
+        + canned_rows(tid)
+        + [[b(text="🔙 لیست تیکت‌ها", callback_data="admin_tickets")]]
     )
     await edit_or_send(call, out[:4000], markup)
+    for vid in voices:  # آخرین ویس‌های تیکت برای شنیدن در همان‌جا
+        try:
+            await call.bot.send_voice(chat_id=call.message.chat.id, voice=vid, caption=f"🎤 ویس تیکت #{tid}")
+        except Exception as e:  # noqa: BLE001
+            logging.info("ticket voice resend failed: %s", e)
 
 
 @dp.callback_query(F.data.startswith("ticket_reply_"), Staff())
@@ -4403,14 +4551,18 @@ async def ticket_staff_reply_start(call: types.CallbackQuery, state: FSMContext)
     tid = int(call.data.split("_")[2])
     await state.set_state(PaymentState.ticket_staff_reply)
     await state.update_data(ticket_id=tid)
-    await call.message.answer(f"✍️ پاسخ خود را برای تیکت #{tid} بنویسید (متن یا عکس):")
+    await call.message.answer(f"✍️ پاسخ خود را برای تیکت #{tid} بنویسید (متن، عکس یا 🎤 ویس):")
 
 
 @dp.message(PaymentState.ticket_staff_reply, Staff())
 async def ticket_staff_reply_send(message: types.Message, state: FSMContext):
-    body = message.caption if message.photo else message.text
-    if not body and not message.photo:
-        await message.answer("لطفاً متن یا عکس بفرستید.")
+    body = message.caption if (message.photo or message.voice) else message.text
+    if not body and not message.photo and not message.voice:
+        await message.answer("لطفاً متن، عکس یا ویس بفرستید.")
+        return
+    problem = voice_problem(message)
+    if problem:
+        await message.answer(problem)
         return
     data = await state.get_data()
     tid = data.get("ticket_id")
@@ -4424,7 +4576,8 @@ async def ticket_staff_reply_send(message: types.Message, state: FSMContext):
         s.add(
             TicketMessage(
                 ticket_id=tid, sender="staff", text=body or "",
-                photo_id=message.photo[-1].file_id if message.photo else None, created_at=get_current_jalali(),
+                photo_id=message.photo[-1].file_id if message.photo else None,
+                voice_id=message.voice.file_id if message.voice else None, created_at=get_current_jalali(),
             )
         )
         s.commit()
@@ -4852,6 +5005,7 @@ async def process_broadcast_handler(message: types.Message, state: FSMContext):
         inline_keyboard=[
             [b(text="📤 ارسال همین الان", callback_data="bc_now")],
             [b(text="⏰ زمان‌بندی ارسال", callback_data="bc_sched")],
+            [b(text="🕒 ارسال هوشمند (ساعت فعالیت هر کاربر)", callback_data=CB.SBC_GO)],
             [b(text="❌ انصراف", callback_data="admin_broadcast_start")],
         ]
     )
@@ -4970,7 +5124,7 @@ def setting_display(key):
     t = meta["type"]
     if t == "toggle":
         return "✅ روشن" if value in ("1", "true", "True") else "⬜ خاموش"
-    if t in ("photo", "sticker"):
+    if t in ("photo", "sticker", "video"):
         return "✅ تنظیم شده" if value else "—"
     if not value:
         return "—"
@@ -5016,6 +5170,9 @@ def render_settings_page(page):
                 InlineKeyboardButton(text="✅ ارسال اعلان وصل شدن", callback_data="recovery_send"),
             ]
         )
+    extra_text, extra_rows = v3_page_extras(page)
+    out += extra_text
+    keyboard.extend(extra_rows)
     keyboard.append([InlineKeyboardButton(text="🔙 بازگشت به تنظیمات", callback_data="admin_settings")])
     return out, InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -5032,6 +5189,7 @@ async def chpost_now(call: types.CallbackQuery):
 @dp.callback_query(F.data.in_({"outage_send", "recovery_send"}), MainAdmin())
 async def manual_outage_send(call: types.CallbackQuery):
     down = call.data == "outage_send"
+    v3_outage_log(down, "اعلام دستی")
     spawn(broadcast_text(call.bot, outage_message(down)))
     log_action(call.from_user.id, "ارسال دستی اعلان " + ("قطعی" if down else "وصل شدن"))
     await call.answer("ارسال برای همه کاربران آغاز شد.", show_alert=True)
@@ -5079,12 +5237,14 @@ async def admin_setting_edit(call: types.CallbackQuery, state: FSMContext):
         "text": "متن جدید را بفرستید. برای پاک کردن، - بفرستید.",
         "photo": "یک عکس بفرستید. برای حذف، - بفرستید.",
         "sticker": "یک استیکر بفرستید. برای حذف، - بفرستید.",
+        "video": "یک ویدیو (یا گیف) بفرستید؛ بهتر است کوتاه و حجم کم باشد. برای حذف، - بفرستید.",
     }
     await state.set_state(PaymentState.editing_setting)
     await state.update_data(setting_key=key)
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="انصراف", callback_data=f"spage_{meta['page']}")]]
-    )
+    kb = [[InlineKeyboardButton(text="انصراف", callback_data=f"spage_{meta['page']}")]]
+    if meta["type"] == "text":
+        kb.insert(0, [InlineKeyboardButton(text="🕘 نسخه‌های قبلی / بازگشت به پیش‌فرض", callback_data=f"{CB.SV_LIST}{key}")])
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
     await edit_or_send(call, f"✏️ <b>{meta['label']}</b>\n\n{hints[meta['type']]}", markup)
 
 
@@ -5099,6 +5259,10 @@ async def admin_setting_save(message: types.Message, state: FSMContext):
 
     t, value = meta["type"], None
     text_in = (message.text or "").strip()
+    if key in ("backup_channel", "force_join_channel", "post_channel"):
+        fchat = forwarded_channel_id(message)
+        if fchat is not None:  # پیام فورواردشده از کانال (برای کانال خصوصی بدون @username)
+            text_in = str(fchat)
     if t == "num":
         raw = text_in.replace(",", "")
         if not raw.isdigit() or not (meta["min"] <= int(raw) <= meta["max"]):
@@ -5138,8 +5302,18 @@ async def admin_setting_save(message: types.Message, state: FSMContext):
                 return
             value = ",".join(f"{a}:{b}" for a, b in tiers)
         if key in ("force_join_channel", "backup_channel") and value:
+            if re.search(r"t\.me/(\+|joinchat/)", value):
+                if key == "backup_channel":
+                    set_setting("backup_channel_link", value.strip())  # لینک برای یادآوری ذخیره می‌شود
+                await message.answer(
+                    "🔒 لینک دعوت کانال خصوصی آیدی ندارد و ربات با آن نمی‌تواند بکاپ بفرستد.\n\n"
+                    "یکی از این دو کار را بکنید:\n"
+                    "1️⃣ ربات را در کانال «ادمین» کنید؛ خودش به شما پیشنهاد ثبت می‌دهد.\n"
+                    "2️⃣ یک پیام از همان کانال را همین‌جا فوروارد کنید."
+                )
+                return
             if not valid_chat_ref(value):
-                await message.answer("آیدی کانال نامعتبر است. مثال: @mychannel یا -1001234567890")
+                await message.answer("آیدی کانال نامعتبر است. مثال: @mychannel یا -1001234567890 (یا یک پیام از کانال فوروارد کنید)")
                 return
             value = value.strip()
     elif t == "photo":
@@ -5158,8 +5332,22 @@ async def admin_setting_save(message: types.Message, state: FSMContext):
         else:
             await message.answer("لطفاً یک استیکر بفرستید یا - برای حذف.")
             return
+    elif t == "video":
+        if message.video:
+            value = "v:" + message.video.file_id
+        elif message.animation:
+            value = "a:" + message.animation.file_id
+        elif text_in == "-":
+            value = ""
+        else:
+            await message.answer("لطفاً یک ویدیو بفرستید یا - برای حذف.")
+            return
 
+    if t == "text":
+        v3_save_version(key, get_setting(key), message.from_user.id)
     set_setting(key, value)
+    if key == "backup_channel" and value:
+        await _backup_channel_after_save(message.bot, message, value)
     await state.clear()
     log_action(message.from_user.id, f"ویرایش تنظیم {key}")
     out, markup = render_settings_page(meta["page"])
@@ -6280,7 +6468,9 @@ async def club_redeem_handler(call: types.CallbackQuery):
             return
         credit = points * value
         user.points = 0
-        user.balance = (user.balance or 0) + credit
+        _b0 = user.balance or 0
+        user.balance = _b0 + credit
+        wlog(s, call.from_user.id, _b0, user.balance, "club_redeem", points)
         s.commit()
     await call.answer(f"✅ {credit:,} تومان به کیف پول شما اضافه شد.", show_alert=True)
     out, markup = club_view(call.from_user.id)
@@ -6324,6 +6514,8 @@ async def guide_connect_handler(call: types.CallbackQuery):
     await call.answer()
     b = InlineKeyboardButton
     general = esc(get_setting("connect_guide").strip() or DEFAULTS["connect_guide"])
+    if get_bool("short_msgs_on"):
+        general = general.split("\n")[0]
     out = general + "\n\n👇 <b>برای آموزش کامل‌تر، دستگاه خود را انتخاب کنید:</b>"
     plats = list(GUIDE_PLATFORMS.items())
     rows = [[b(text=lbl, callback_data=f"guide_p_{k}") for k, lbl in plats[i : i + 2]] for i in range(0, len(plats), 2)]
@@ -6350,6 +6542,9 @@ async def guide_platform_handler(call: types.CallbackQuery):
     rows.append([b(text="⬅️ انتخاب دستگاه دیگر", callback_data="guide_connect")])
     rows.append([b(text="🏠 منوی اصلی", callback_data="main_menu")])
     await edit_or_send(call, out, InlineKeyboardMarkup(inline_keyboard=rows))
+    vid = (get_setting(f"guide_video_{plat}") or "").strip()
+    if vid:
+        await send_saved_video(call.bot, call.from_user.id, vid, caption="🎬 آموزش تصویری کوتاه")
 
 
 # --- تخفیف زمان‌دار (ادمین) ---
@@ -7391,6 +7586,9 @@ def outage_message(down):
 
 
 async def announce_outage(bot, down, bad_urls=None):
+    mins = v3_outage_log(down, ", ".join(bad_urls or [])[:200])
+    if not down:
+        spawn(v3_post_recovery(bot, mins))
     if down:
         detail = "\n".join(f"• {esc(u)}" for u in (bad_urls or []))
         await notify_staff(bot, f"🔴 <b>مانیتور: قطعی تشخیص داده شد</b>\n{detail}")
@@ -8421,7 +8619,16 @@ async def _finish_config_delivery(bot, chat_id, admin_id, state, config_text, no
         extra_text = get_setting("config_extra_text").strip()
         if extra_text:
             notify += "\n\n" + esc(extra_text)
-        await bot.send_message(chat_id=target_user_id, text=notify, reply_markup=delivery_markup())
+        dmarkup = delivery_markup()
+        if get_bool("short_msgs_on"):
+            notify = (
+                f"🎉 سفارشت آماده شد!\n\n📦 {esc(plan_name or '')}\n"
+                f"📅 تا {jalali_from_iso(end_date.isoformat())} ({days} روزه)\n\n{config_html}"
+            )
+            rows = list(dmarkup.inline_keyboard) if dmarkup else []
+            rows.insert(0, [InlineKeyboardButton(text="ℹ️ جزئیات و راهنما", callback_data=CB.MORE)])
+            dmarkup = InlineKeyboardMarkup(inline_keyboard=rows)
+        await bot.send_message(chat_id=target_user_id, text=notify, reply_markup=dmarkup)
         await send_sticker(bot, target_user_id, "sticker_config")
         await send_config_qr(bot, target_user_id, config_text)
     except Exception as e:  # noqa: BLE001
@@ -8430,7 +8637,7 @@ async def _finish_config_delivery(bot, chat_id, admin_id, state, config_text, no
     if not is_trial:
         spawn(post_sale_feed(bot, plan_name, sale_req_type))
     if not is_trial:
-        await send_rating_request(bot, target_user_id, req_id)
+        await v3_post_delivery(bot, target_user_id, req_id)
 
 
 @dp.message(PaymentState.waiting_for_admin_config, Staff())
@@ -8917,6 +9124,7 @@ class CartEvent(Base):
     price = Column(Integer, default=0)
     created_iso = Column(String)
     stage = Column(Integer, default=0)  # 0 جدید | 1 یادآوری اول | 2 تمام
+    step = Column(String)  # مرحلهٔ آخری که کاربر به آن رسید: pay | receipt
 
 
 class GiftCode(Base):
@@ -9261,7 +9469,7 @@ def record_cart(user_id, label, price):
     try:
         with SessionLocal() as s:
             s.query(CartEvent).filter(CartEvent.user_id == user_id, CartEvent.stage < 2).delete()
-            s.add(CartEvent(user_id=user_id, label=label, price=int(price or 0), created_iso=iso_now_minute(), stage=0))
+            s.add(CartEvent(user_id=user_id, label=label, price=int(price or 0), created_iso=iso_now_minute(), stage=0, step="pay"))
             s.commit()
     except Exception as e:  # noqa: BLE001
         logging.warning("record_cart failed: %s", e)
@@ -9334,7 +9542,9 @@ async def job_comp(bot):
             u = s.get(User, r.user_id)
             if u is None:
                 continue
-            u.balance = min(MAX_BALANCE, (u.balance or 0) + amount)
+            _b0 = u.balance or 0
+            u.balance = min(MAX_BALANCE, _b0 + amount)
+            wlog(s, r.user_id, _b0, u.balance, "delay_compensation", r.id)
             glog_add(s, r.user_id, "comp", r.id)
             glog_add(s, r.user_id, "compday", day_key)
             todo.append((r.user_id, r.id))
@@ -9723,7 +9933,9 @@ def redeem_gift(uid, code):
         if s.query(GiftUse.id).filter(GiftUse.gift_id == g.id, GiftUse.user_id == uid).first():
             return 0, "قبلاً از این کد استفاده کردی."
         u = get_or_create_user(s, uid)
-        u.balance = min(MAX_BALANCE, (u.balance or 0) + (g.amount or 0))
+        _b0 = u.balance or 0
+        u.balance = min(MAX_BALANCE, _b0 + (g.amount or 0))
+        wlog(s, uid, _b0, u.balance, "gift_code", code)
         g.used_count = (g.used_count or 0) + 1
         s.add(GiftUse(gift_id=g.id, user_id=uid))
         amount = g.amount or 0
@@ -9818,8 +10030,11 @@ async def transfer_cmd(message: types.Message, command: CommandObject):
             if (to.balance or 0) + amount > MAX_BALANCE:
                 await message.answer("سقف موجودی گیرنده پر می‌شه.")
                 return
-            me.balance = (me.balance or 0) - amount - fee
-            to.balance = (to.balance or 0) + amount
+            _m0, _t0 = me.balance or 0, to.balance or 0
+            me.balance = _m0 - amount - fee
+            to.balance = _t0 + amount
+            wlog(s, uid, _m0, me.balance, "transfer_out", to_id)
+            wlog(s, to_id, _t0, to.balance, "transfer_in", uid)
             glog_add(s, uid, "transfer", f"{to_id}:{amount}")
             s.commit()
     await message.answer(f"✅ {amount:,} تومان به <code>{to_id}</code> منتقل شد.")
@@ -9991,8 +10206,2454 @@ async def growth_help(message: types.Message):
     )
 
 
+# ===========================================================================
+# ۱۳) بستهٔ v3: اعتمادسازی، فاکتور، نظرات، دفتر کل کیف پول، پشتیبانی هوشمند،
+#     افزونه، آپسل، قرعه‌کشی و ارسال هوشمند
+#     همهٔ تنظیمات این بخش‌ها از «⚙️ تنظیمات ربات» (بخش‌های 🛡 📒 🧾 🎧 🎬 ➕) قابل تغییر است.
+# ===========================================================================
+class V3State(StatesGroup):
+    review_text = State()
+    addon_receipt = State()
+
+
+class CB:
+    """ثابت‌های مرکزی callback_data بخش‌های جدید؛ هم دکمه‌ها و هم هندلرها از همین‌جا می‌خوانند."""
+
+    REVIEWS = "v3_reviews"
+    RV_WRITE = "v3_rv_"  # + شناسهٔ سفارش
+    RV_SKIP = "v3_rvskip"
+    RV_PENDING = "v3_rvpend"
+    RV_OK = "v3_rva_"  # + شناسهٔ امتیاز
+    RV_NO = "v3_rvr_"
+    STATUS = "v3_status"
+    STATUS_POST = "v3_statuspost"
+    HELP = "v3_help"
+    MORE = "v3_more"
+    CHK_MENU = "v3_chkmenu"
+    CHK = "v3_chk_"  # + شناسهٔ سرویس
+    TRI_OK = "v3_triok"
+    TRI_GO = "v3_trigo"
+    CK_OK = "v3_ckok_"  # + شناسهٔ سفارش
+    CK_NO = "v3_ckno_"
+    FU_OK = "v3_fuok_"
+    FU_BAD = "v3_fubad_"
+    S7 = "v3_s7_"  # + سفارش_امتیاز
+    INV_LAST = "v3_invlast"
+    INV = "v3_inv_"  # + شناسهٔ سفارش
+    CANNED = "v3_cn_"  # + تیکت_ایندکس
+    ALT_ASK = "v3_altask"
+    ALT_GO = "v3_altgo"
+    PAYHELP = "v3_payhelp"
+    ADDON = "v3_ad_"  # + شناسهٔ سرویس
+    ADDON_PICK = "v3_adp_"  # + سرویس_ایندکس
+    ADDON_WALLET = "v3_adw_"
+    ADDON_CARD = "v3_adc_"
+    UPSELL_RENEW = "v3_rn_"  # + سرویس_پلن
+    WL = "v3_wl_"  # + آیدی کاربر
+    WL_FIX = "v3_wlfix_"
+    WL_RUN = "v3_wlrun"
+    LOT = "v3_lot_"  # + نوع
+    LOT_GO = "v3_lotgo_"
+    LOT_FORCE = "v3_lotf_"
+    SBC_GO = "v3_sbcgo"
+    SV_LIST = "v3_sv_"  # + کلید تنظیم
+    SV_RESTORE = "v3_svr_"  # + شناسهٔ نسخه
+    SV_DEFAULT = "v3_svd_"  # + کلید تنظیم
+    DROPOFF = "v3_dropoff"
+    BK_SET = "v3_bkch_"  # + آیدی عددی کانال (منفی)
+    BK_SKIP = "v3_bkskip"
+
+
+DEFAULTS.update(
+    {
+        # --- اعتمادسازی ---
+        "social_on": "1",
+        "social_min": "50",
+        "social_deliv_min": "20",
+        "status_line_on": "1",
+        "lastdeliv_on": "1",
+        "lastdeliv_hours": "24",
+        "steps_on": "1",
+        "steps_text": "🚀 شروع در ۳ قدم ساده:\nانتخاب پلن ← واریز ← تحویل در چند دقیقه",
+        "back_on": "1",
+        "back_days": "30",
+        "news_on": "1",
+        "last_news": "",
+        "last_news_iso": "",
+        "reviews_on": "1",
+        "reviews_count": "5",
+        "trust_footer_on": "1",
+        "trust_footer_text": "🔒 اطلاعات شما نزد ما محفوظ است | 🎧 پشتیبانی آنلاین",
+        "status_page_on": "1",
+        "status_post_on": "0",
+        # --- پرداخت و فاکتور ---
+        "paynote_on": "1",
+        "paynote_text": "به نام {holder} — بعد از واریز، رسید را بفرست؛ در صورت مشکل پول به کیف پولت برمی‌گردد",
+        "payhelp_on": "1",
+        "invoice_on": "1",
+        "eta_on": "1",
+        "night_on": "1",
+        "support_hours_on": "0",
+        "support_from": "9",
+        "support_to": "24",
+        "support_sla": "30",
+        # --- پشتیبانی هوشمند ---
+        "trouble_on": "1",
+        "trouble_keywords": "وصل نمی|وصل نیست|وصل نشد|اتصال|قطع|کار نمی|نمی‌کنه|نمیکنه|کندی|خیلی کند|disconnect|connect",
+        "trouble_text": (
+            "🔧 قبل از ارسال تیکت، این چند مورد رو امتحان کن؛ بیشتر مشکل‌ها همین‌جا حل می‌شه:\n\n"
+            "1️⃣ داخل برنامه «Update Subscription» (به‌روزرسانی اشتراک) رو بزن\n"
+            "2️⃣ برنامه رو به آخرین نسخه آپدیت کن\n"
+            "3️⃣ شبکه رو عوض کن (از وای‌فای به دیتا یا برعکس)\n"
+            "4️⃣ حالت هواپیما رو یک‌بار روشن و خاموش کن\n\n"
+            "یا با دکمهٔ «🩺 چک وضعیت سرویس من» ببین مشکل از لینک توئه یا از سمت سرور."
+        ),
+        "canned_on": "1",
+        "canned_replies": (
+            "آپدیت برنامه|لطفاً برنامه رو به آخرین نسخه آپدیت کنید و دوباره اتصال رو امتحان کنید 🙏\n"
+            "آپدیت ساب‌لینک|داخل برنامه گزینهٔ Update Subscription رو بزنید و دوباره وصل بشید.\n"
+            "تغییر شبکه|لطفاً شبکه رو عوض کنید (وای‌فای ↔ دیتا) و دوباره امتحان کنید.\n"
+            "در حال بررسی|درخواستتون رو بررسی می‌کنیم و به‌زودی خبر می‌دیم 🙏"
+        ),
+        "alt_bot": "",
+        "alt_channel": "",
+        "alt_text": "🔁 <b>آدرس‌های جایگزین</b>\nاگه ربات یا کانال اصلی در دسترس نبود، از این آدرس‌ها استفاده کن:",
+        # --- راهنما و ویدیو ---
+        "help_on": "1",
+        "help_video": "",
+        "help_text": "🆘 <b>کمک می‌خواهی؟ ساده توضیح می‌دیم:</b>\n\n1️⃣ برنامه رو نصب کن\n2️⃣ لینک سرویس رو کپی کن\n3️⃣ داخل برنامه «افزودن اشتراک» رو بزن و لینک رو بچسبون\n4️⃣ دکمهٔ اتصال رو بزن\n\nاگه گیر کردی، دکمهٔ پایین رو بزن تا خودمون کمک کنیم.",
+        "guide_video_android": "",
+        "guide_video_ios": "",
+        "guide_video_windows": "",
+        "guide_video_mac": "",
+        "short_msgs_on": "0",
+        "connect_check_on": "1",
+        "followup24_on": "1",
+        "followup24_text": "سلام 👋 یک روز از خریدت گذشته. همه‌چیز خوبه؟",
+        "survey7_on": "1",
+        "survey7_text": "یک هفته از استفاده‌ت گذشته 🙌\nکیفیت واقعی سرویس (سرعت و پایداری) رو چطور می‌بینی؟",
+        # --- مالی، قرعه‌کشی، افزونه، آپسل ---
+        "reconcile_on": "1",
+        "lottery_remind_on": "0",
+        "lottery_day": "1",
+        "lottery_winners": "3",
+        "lottery_prize": "50000",
+        "lottery_announce_on": "1",
+        "addon_on": "0",
+        "addons": "gb:10:50000\ngb:20:90000\nday:7:30000",
+        "upsell_on": "1",
+        "upsell_renews": "3",
+        "downsell_on": "0",
+        "downsell_pct": "40",
+    }
+)
+
+SETTING_PAGES.update(
+    {
+        "trust": "🛡 اعتمادسازی و آمار واقعی",
+        "pay2": "🧾 پرداخت، فاکتور و زمان تحویل",
+        "supp2": "🎧 پشتیبانی هوشمند و عیب‌یابی",
+        "guide2": "🎬 ویدیو، راهنما و پیگیری بعد از خرید",
+        "fin": "📒 دفتر کل و قرعه‌کشی",
+        "sales2": "➕ افزونه و پیشنهاد هوشمند پلن",
+    }
+)
+
+SETTINGS.update(
+    {
+        # --- trust ---
+        "social_on": dict(page="trust", type="toggle", label="خط آمار زیر خوش‌آمد (مشتری / رضایت / زمان تحویل)"),
+        "social_min": dict(page="trust", type="num", label="حداقل تعداد نظر و مشتری برای نمایش (زیر این عدد نمایش داده نمی‌شود)", min=1, max=100000),
+        "social_deliv_min": dict(page="trust", type="num", label="حداقل تعداد تحویل برای نمایش میانگین زمان", min=1, max=10000),
+        "status_line_on": dict(page="trust", type="toggle", label="خط وضعیت سرورها (🟢/🔴؛ فقط با مانیتور روشن)"),
+        "lastdeliv_on": dict(page="trust", type="toggle", label="نمایش «آخرین تحویل: X دقیقه پیش»"),
+        "lastdeliv_hours": dict(page="trust", type="num", label="حداکثر سن آخرین تحویل برای نمایش (ساعت)", min=1, max=168),
+        "steps_on": dict(page="trust", type="toggle", label="توضیح ۳‌مرحله‌ای برای کاربر جدید"),
+        "steps_text": dict(page="trust", type="text", label="متن توضیح ۳‌مرحله‌ای"),
+        "back_on": dict(page="trust", type="toggle", label="پیام ویژه برای کاربر بازگشتی"),
+        "back_days": dict(page="trust", type="num", label="بازگشتی = چند روز غیبت", min=7, max=365),
+        "news_on": dict(page="trust", type="toggle", label="«آخرین خبر کانال» در منوی اصلی"),
+        "last_news": dict(page="trust", type="text", label="آخرین خبر (خودکار از پست‌های کانال؛ دستی هم می‌توانید بنویسید)"),
+        "reviews_on": dict(page="trust", type="toggle", label="نظرات مشتریان (با تأیید ادمین)"),
+        "reviews_count": dict(page="trust", type="num", label="تعداد نظرهای نمایش‌داده‌شده (۳ تا ۵)", min=3, max=5),
+        "trust_footer_on": dict(page="trust", type="toggle", label="خط اطمینان کنار پرداخت (🔒 / 🎧)"),
+        "trust_footer_text": dict(page="trust", type="text", label="متن خط اطمینان"),
+        "status_page_on": dict(page="trust", type="toggle", label="صفحهٔ وضعیت سرویس‌ها (تاریخچه قطعی‌ها)"),
+        "status_post_on": dict(page="trust", type="toggle", label="ارسال خودکار پایان قطعی به کانال"),
+        # --- pay2 ---
+        "paynote_on": dict(page="pay2", type="toggle", label="یادداشت اطمینان کنار شمارهٔ کارت (مرحلهٔ ۳)"),
+        "paynote_text": dict(page="pay2", type="text", label="متن یادداشت ({holder} = نام صاحب کارت)"),
+        "payhelp_on": dict(page="pay2", type="toggle", label="دکمهٔ «❓ سؤال دارم» در صفحهٔ پرداخت"),
+        "invoice_on": dict(page="pay2", type="toggle", label="فاکتور رسمی با شمارهٔ پیگیری بعد از هر خرید"),
+        "eta_on": dict(page="pay2", type="toggle", label="تخمین زمان تحویل از داده واقعی (۲۰ سفارش اخیر)"),
+        "night_on": dict(page="pay2", type="toggle", label="پیام خودکار شب (ادمین‌ها آفلاین‌اند)"),
+        "support_hours_on": dict(page="pay2", type="toggle", label="ساعت کاری پشتیبانی مشخص"),
+        "support_from": dict(page="pay2", type="num", label="شروع ساعت کاری (۰ تا ۲۳)", min=0, max=23),
+        "support_to": dict(page="pay2", type="num", label="پایان ساعت کاری (۱ تا ۲۴)", min=1, max=24),
+        "support_sla": dict(page="pay2", type="num", label="وعدهٔ پاسخ (دقیقه)", min=5, max=1440),
+        # --- supp2 ---
+        "trouble_on": dict(page="supp2", type="toggle", label="پاسخ خودکار عیب‌یابی قبل از ساخت تیکت (کلیدواژه‌ای)"),
+        "trouble_keywords": dict(page="supp2", type="text", label="کلیدواژه‌ها (با | جدا کنید)"),
+        "trouble_text": dict(page="supp2", type="text", label="متن مراحل عیب‌یابی"),
+        "canned_on": dict(page="supp2", type="toggle", label="پاسخ‌های آماده زیر هر تیکت (برای ادمین)"),
+        "canned_replies": dict(page="supp2", type="text", label="پاسخ‌های آماده (هر خط: عنوان|متن؛ حداکثر ۶ خط)"),
+        "alt_bot": dict(page="supp2", type="text", label="ربات پشتیبان (@username)"),
+        "alt_channel": dict(page="supp2", type="text", label="کانال یدک (@username یا لینک)"),
+        "alt_text": dict(page="supp2", type="text", label="متن بالای آدرس‌های جایگزین"),
+        "help_on": dict(page="supp2", type="toggle", label="دکمهٔ «🆘 کمک می‌خواهم»"),
+        "help_video": dict(page="supp2", type="video", label="ویدیوی ۶۰ ثانیه‌ای نصب و اتصال (برای دکمهٔ کمک)"),
+        "help_text": dict(page="supp2", type="text", label="متن دکمهٔ کمک (وقتی ویدیو نباشد/همراه ویدیو)"),
+        # --- guide2 ---
+        "guide_video_android": dict(page="guide2", type="video", label="ویدیوی آموزش اندروید"),
+        "guide_video_ios": dict(page="guide2", type="video", label="ویدیوی آموزش آیفون"),
+        "guide_video_windows": dict(page="guide2", type="video", label="ویدیوی آموزش ویندوز"),
+        "guide_video_mac": dict(page="guide2", type="video", label="ویدیوی آموزش مک"),
+        "short_msgs_on": dict(page="guide2", type="toggle", label="پیام‌های کوتاه موبایلی (کانفیگ + دکمهٔ «جزئیات»)"),
+        "connect_check_on": dict(page="guide2", type="toggle", label="پیام «✅ وصل شدم / ❌ وصل نشدم» بعد از تحویل"),
+        "followup24_on": dict(page="guide2", type="toggle", label="پیگیری ۲۴ ساعته بعد از خرید"),
+        "followup24_text": dict(page="guide2", type="text", label="متن پیگیری ۲۴ ساعته"),
+        "survey7_on": dict(page="guide2", type="toggle", label="نظرسنجی کیفیت بعد از ۷ روز استفاده"),
+        "survey7_text": dict(page="guide2", type="text", label="متن نظرسنجی ۷ روزه"),
+        # --- fin ---
+        "reconcile_on": dict(page="fin", type="toggle", label="تطبیق شبانهٔ موجودی کیف پول‌ها با دفتر کل"),
+        "lottery_remind_on": dict(page="fin", type="toggle", label="یادآوری ماهانهٔ قرعه‌کشی به ادمین"),
+        "lottery_day": dict(page="fin", type="num", label="روز ماه (شمسی) برای یادآوری قرعه‌کشی", min=1, max=28),
+        "lottery_winners": dict(page="fin", type="num", label="تعداد برندگان هر قرعه‌کشی", min=1, max=50),
+        "lottery_prize": dict(page="fin", type="num", label="جایزهٔ هر برنده (تومان اعتبار)", min=1000, max=100000000),
+        "lottery_announce_on": dict(page="fin", type="toggle", label="اعلام برندگان (ناشناس) در کانال"),
+        # --- sales2 ---
+        "addon_on": dict(page="sales2", type="toggle", label="افزونه (حجم یا روز اضافه بدون تعویض پلن)"),
+        "addons": dict(page="sales2", type="text", label="افزونه‌ها (هر خط: gb:مقدار:قیمت یا day:مقدار:قیمت؛ حداکثر ۶ خط)"),
+        "upsell_on": dict(page="sales2", type="toggle", label="آپسل هوشمند (پلن بزرگ‌تر به‌صرفه‌تر)"),
+        "upsell_renews": dict(page="sales2", type="num", label="بعد از چند تمدید پشت‌سرهم پیشنهاد بده", min=2, max=10),
+        "downsell_on": dict(page="sales2", type="toggle", label="پیشنهاد پلن ارزان‌تر بر اساس مصرف واقعی (صادقانه)"),
+        "downsell_pct": dict(page="sales2", type="num", label="اگر مصرف کمتر از این درصد حجم بود (٪)", min=10, max=80),
+    }
+)
+
+GROWTH_CONDS.update(
+    {
+        "reviews": "reviews_on",
+        "statuspage": "status_page_on",
+        "help": "help_on",
+        "addon": "addon_on",
+    }
+)
+UB_ITEMS["main"].append(dict(key="reviews", label="💬 نظرات مشتریان", cb=CB.REVIEWS, wide=True, cond="reviews", hide_default=True))
+UB_ITEMS["main"].append(dict(key="statuspage", label="📡 وضعیت سرویس‌ها", cb=CB.STATUS, wide=True, cond="statuspage", hide_default=True))
+UB_ITEMS["main"].append(dict(key="help", label="🆘 کمک می‌خواهم", cb=CB.HELP, wide=True, cond="help"))
+UB_ITEMS["support"].insert(0, dict(key="help", label="🆘 کمک می‌خواهم", cb=CB.HELP, wide=True, cond="help"))
+UB_ITEMS["support"].insert(-1, dict(key="check", label="🩺 چک وضعیت سرویس من", cb=CB.CHK_MENU, wide=True))
+UB_ITEMS["support"].insert(-1, dict(key="statuspage", label="📡 وضعیت سرویس‌ها", cb=CB.STATUS, wide=True, cond="statuspage"))
+UB_ITEMS["support"].insert(-1, dict(key="reviews", label="💬 نظرات مشتریان", cb=CB.REVIEWS, wide=True, cond="reviews"))
+UB_ITEMS["account"].insert(1, dict(key="invoice", label="🧾 آخرین فاکتور", cb=CB.INV_LAST, wide=True))
+UB_ITEMS["svc"].insert(-2, dict(key="check", label="🩺 چک وضعیت", cb=CB.CHK + "{id}", cond="link"))
+UB_ITEMS["svc"].insert(-2, dict(key="addon", label="➕ حجم/روز اضافه", cb=CB.ADDON + "{id}", cond="addon"))
+UB_ITEMS["deliv"].insert(-1, dict(key="help", label="🆘 کمک می‌خواهم", cb=CB.HELP, wide=True, cond="help", hide_default=True))
+SALE_TYPES.append("addon")
+TYPE_LABELS["addon"] = "افزونه"
+
+_returning = {}  # user_id -> تعداد روز غیبت (برای پیام خوش‌برگشتی)
+_v3c = {}  # کش کوتاه‌مدت آمارها
+_triage_msgs = {}  # user_id -> پیام اصلی تیکت تا زمان تصمیم کاربر
+_chk_last = {}  # user_id -> زمان آخرین «چک وضعیت»
+
+
+# ---------------------------------------------------------------------------
+# ابزارهای مشترک
+# ---------------------------------------------------------------------------
+_FA = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+
+def fa(n):
+    """عدد با ارقام فارسی، جداکنندهٔ هزارگان ٬ و ممیز ٫."""
+    if isinstance(n, float):
+        if n.is_integer():
+            n = int(n)
+        else:
+            return f"{n:,.1f}".replace(",", "٬").replace(".", "٫").translate(_FA)
+    return f"{int(n):,}".replace(",", "٬").translate(_FA)
+
+
+def now_naive():
+    return now_iran().replace(tzinfo=None)
+
+
+def jalali_str_to_dt(js):
+    """'1405/08/20 - 14:30:05' را به datetime ساده (وقت ایران) تبدیل می‌کند؛ نامعتبر → None."""
+    try:
+        nums = re.findall(r"\d+", (js or "").translate(DIGITS_FA))
+        y, mo, d, hh, mm, ss = [int(x) for x in nums[:6]]
+        return jdatetime.datetime(y, mo, d, hh, mm, ss).togregorian()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def dt_to_jalali_str(dt):
+    return f"{jdatetime.date.fromgregorian(date=dt.date()).strftime('%Y/%m/%d')} - {dt.strftime('%H:%M:%S')}"
+
+
+def v3_cached(key, ttl, fn):
+    hit = _v3c.get(key)
+    now = time.time()
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    if len(_v3c) > 500:
+        _v3c.clear()
+    _v3c[key] = (now, val)
+    return val
+
+
+def trimmed_mean(vals, trim=0.1):
+    v = sorted(vals)
+    if not v:
+        return None
+    k = int(len(v) * trim)
+    core = v[k : len(v) - k] or v
+    return sum(core) / len(core)
+
+
+def fmt_minutes(m):
+    m = max(1, int(round(m)))
+    if m < 90:
+        return f"{fa(m)} دقیقه"
+    return f"حدود {fa(round(m / 60, 1))} ساعت"
+
+
+def fmt_ago(minutes):
+    minutes = int(minutes)
+    if minutes < 1:
+        return "همین الان"
+    if minutes < 60:
+        return f"{fa(minutes)} دقیقه پیش"
+    return f"{fa(minutes // 60)} ساعت پیش"
+
+
+def wlog(s, uid, before, after, reason, ref="", by=None):
+    """یک ردیف دفتر کل می‌نویسد (داخل همان تراکنشِ تغییر موجودی؛ فقط اگر موجودی واقعاً عوض شده باشد)."""
+    before, after = int(before or 0), int(after or 0)
+    if before == after:
+        return
+    s.add(
+        WalletTx(
+            user_id=uid, delta=after - before, before=before, after=after, reason=reason,
+            ref=str(ref if ref is not None else ""), by=by, created_iso=iso_now_minute(),
+        )
+    )
+
+
+def v3_touch(u):
+    """آخرین بازدید و ساعت معمول فعالیت کاربر را به‌روز می‌کند (داخل touch_user)."""
+    now = now_naive()
+    prev = u.last_seen_iso
+    if prev:
+        try:
+            gap = (now - datetime.strptime(prev, TS_FMT)).days
+            if gap >= max(7, get_int("back_days")):
+                _returning[u.user_id] = gap
+        except ValueError:
+            pass
+    u.last_seen_iso = now.strftime(TS_FMT)
+    cur = now.hour
+    old = u.active_hour
+    if old is None:
+        u.active_hour = cur
+    else:
+        d = (cur - old + 12) % 24 - 12  # اختلاف دایره‌ای تا نیمه‌شب درست کار کند
+        u.active_hour = (old + int(round(d * 0.25))) % 24
+
+
+# ---------------------------------------------------------------------------
+# آمار اعتماد: مشتری، رضایت، زمان تحویل (فقط عدد واقعی و بالای حداقل نمونه)
+# ---------------------------------------------------------------------------
+def delivery_minutes_list(limit=50, types=("buy", "renew")):
+    out = []
+    with SessionLocal() as s:
+        rows = (
+            s.query(Request.created_iso, Request.answered_at)
+            .filter(
+                Request.status == "answered", Request.req_type.in_(types),
+                Request.created_iso.isnot(None), Request.answered_at.isnot(None),
+            )
+            .order_by(Request.id.desc())
+            .limit(limit)
+            .all()
+        )
+    for created_iso, answered in rows:
+        try:
+            c = datetime.strptime(created_iso, TS_FMT)
+        except (TypeError, ValueError):
+            continue
+        a = jalali_str_to_dt(answered)
+        if a is None:
+            continue
+        m = (a - c).total_seconds() / 60
+        if 0 <= m <= 24 * 60:  # تحویل‌های بیش از ۲۴ ساعت نمایندهٔ سرعت عادی نیستند
+            out.append(m)
+    return out
+
+
+def eta_minutes():
+    def calc():
+        mins = delivery_minutes_list(20)
+        return trimmed_mean(mins) if len(mins) >= 5 else None
+
+    return v3_cached("eta", 300, calc)
+
+
+def social_stats():
+    def calc():
+        today = today_iran().isoformat()
+        with SessionLocal() as s:
+            cust = (
+                s.query(func.count(func.distinct(UserConfig.user_id)))
+                .filter(or_(UserConfig.expires_at.is_(None), UserConfig.expires_at >= today))
+                .scalar()
+                or 0
+            )
+            n_rate, avg = s.query(func.count(Rating.id), func.avg(Rating.score)).first()
+        mins = delivery_minutes_list(50)
+        return dict(
+            customers=int(cust), n_rate=int(n_rate or 0), avg=float(avg) if avg is not None else None,
+            deliv=trimmed_mean(mins), n_deliv=len(mins),
+        )
+
+    return v3_cached("social", 600, calc)
+
+
+def social_line():
+    if not get_bool("social_on"):
+        return ""
+    st = social_stats()
+    need, need_d = max(1, get_int("social_min")), max(1, get_int("social_deliv_min"))
+    parts = []
+    if st["customers"] >= need:
+        parts.append(f"👥 {fa(st['customers'])} مشتری فعال")
+    if st["n_rate"] >= need and st["avg"] is not None:
+        parts.append(f"⭐ میانگین رضایت {fa(round(st['avg'], 1))} از ۵")
+    if st["n_deliv"] >= need_d and st["deliv"] is not None:
+        parts.append(f"🚀 میانگین زمان تحویل {fmt_minutes(st['deliv'])}")
+    return " | ".join(parts)
+
+
+def server_status_line():
+    if not get_bool("status_line_on"):
+        return ""
+    with SessionLocal() as s:
+        open_out = s.query(OutageLog.id).filter(OutageLog.ended_iso.is_(None)).first() is not None
+    if open_out or _monitor.get("down"):
+        return "🔴 مشکل شناسایی شده، در حال رفع"
+    if get_bool("monitor_on") and parse_urls(get_setting("monitor_urls")):
+        return "🟢 سرورها در حال حاضر پایدارند"
+    return ""  # بدون مانیتور، وضعیت نامعلوم است و ادعای «پایدار» نمی‌کنیم
+
+
+def last_delivery_line():
+    if not get_bool("lastdeliv_on"):
+        return ""
+
+    def calc():
+        with SessionLocal() as s:
+            rows = (
+                s.query(Request.answered_at)
+                .filter(Request.status == "answered", Request.req_type.in_(["buy", "renew"]), Request.answered_at.isnot(None))
+                .order_by(Request.id.desc())
+                .limit(5)
+                .all()
+            )
+        best = None
+        for (a,) in rows:
+            dt = jalali_str_to_dt(a)
+            if dt is not None and (best is None or dt > best):
+                best = dt
+        return best
+
+    last = v3_cached("lastdeliv", 60, calc)
+    if last is None:
+        return ""
+    minutes = (now_naive() - last).total_seconds() / 60
+    if minutes < 0 or minutes > max(1, get_int("lastdeliv_hours")) * 60:
+        return ""
+    return f"✅ آخرین تحویل: {fmt_ago(minutes)}"
+
+
+def news_line():
+    if not get_bool("news_on"):
+        return ""
+    text_ = (get_setting("last_news") or "").strip()
+    if not text_:
+        return ""
+    iso = get_setting("last_news_iso")
+    if iso:
+        try:
+            if (now_naive() - datetime.strptime(iso, TS_FMT)).days > 14:
+                return ""
+        except ValueError:
+            pass
+    short = text_.replace("\n", " ")
+    short = short if len(short) <= 110 else short[:110] + "…"
+    return f"📰 آخرین خبر کانال: {esc(short)}"
+
+
+def v3_welcome_extras(user_id, is_new):
+    """بلوک‌های اعتمادساز زیر خوش‌آمدگویی؛ خطا در این بخش هرگز منو را خراب نمی‌کند."""
+    try:
+        proof = [x for x in (social_line(), server_status_line(), last_delivery_line()) if x]
+        parts = []
+        if proof:
+            parts.append("\n".join(proof))
+        away = _returning.pop(user_id, None)
+        if is_new and get_bool("steps_on"):
+            t = (get_setting("steps_text") or "").strip() or DEFAULTS["steps_text"]
+            parts.append(esc(t))
+        elif away and get_bool("back_on"):
+            parts.append(f"👋 خوش برگشتی! حدود {fa(away)} روز بود ندیده بودیمت؛ سرویس‌ها و پلن‌ها رو یه نگاه بنداز.")
+        nl = news_line()
+        if nl:
+            parts.append(nl)
+        return ("\n\n" + "\n\n".join(parts)) if parts else ""
+    except Exception as e:  # noqa: BLE001
+        logging.warning("welcome extras failed: %s", e)
+        return ""
+
+
+def trust_footer():
+    if not get_bool("trust_footer_on"):
+        return ""
+    t = (get_setting("trust_footer_text") or "").strip() or DEFAULTS["trust_footer_text"]
+    return "\n\n<i>" + esc(t) + "</i>"
+
+
+# ---------------------------------------------------------------------------
+# ساعت کاری، زمان تحویل و پیام شب
+# ---------------------------------------------------------------------------
+def support_is_online(now=None):
+    if not get_bool("support_hours_on"):
+        return True
+    h = (now or now_naive()).hour
+    return get_int("support_from") <= h < get_int("support_to")
+
+
+def support_hours_line():
+    if not get_bool("support_hours_on"):
+        return ""
+    state = "🟢 الان آنلاین هستیم" if support_is_online() else "🌙 الان خارج از ساعت کاری‌ایم"
+    return (
+        f"⏰ پاسخ در کمتر از {fa(max(5, get_int('support_sla')))} دقیقه، "
+        f"ساعت {fa(get_int('support_from'))} تا {fa(get_int('support_to'))}\n{state}"
+    )
+
+
+def night_notice():
+    if not (get_bool("night_on") and get_bool("support_hours_on")) or support_is_online():
+        return ""
+    return f"\n\n🌙 ادمین‌ها الان آفلاین‌اند؛ سفارشت ثبت شد و صبح حدود ساعت {fa(get_int('support_from'))} تحویل می‌شه."
+
+
+def eta_line(default="⏱ بعد از ارسال رسید، معمولاً ظرف ۳۰ دقیقه آماده می‌شه."):
+    if get_bool("eta_on"):
+        m = eta_minutes()
+        if m is not None:
+            return f"⏱ معمولاً حدود {fmt_minutes(m).replace('حدود ', '')} (میانگین سفارش‌های اخیر)"
+    return default
+
+
+def pending_extra():
+    out = ""
+    try:
+        if get_bool("eta_on"):
+            m = eta_minutes()
+            if m is not None:
+                out += f"\n⏱ میانگین تحویل اخیر: {fmt_minutes(m)}"
+        out += night_notice()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("pending extra failed: %s", e)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# فاکتور رسمی
+# ---------------------------------------------------------------------------
+def invoice_text(req_id, uid=None):
+    with SessionLocal() as s:
+        r = s.get(Request, req_id)
+        if r is None or (uid is not None and r.user_id != uid):
+            return None
+        d = dict(
+            type=r.req_type, plan=r.plan_name, price=r.price or 0, created=r.created_at, answered=r.answered_at,
+            wallet=bool(r.paid_wallet), code=r.discount_code, status=r.status,
+        )
+    status = {"answered": "✅ انجام شد", "rejected": "❌ رد شد"}.get(d["status"], "⏳ در انتظار بررسی")
+    out = (
+        "🧾 <b>فاکتور Swan VPN</b>\n\n"
+        f"🔢 شمارهٔ پیگیری: <code>SW-{req_id:06d}</code>\n"
+        f"📌 نوع: {TYPE_LABELS.get(d['type'], d['type'] or '')}\n"
+        f"📦 {esc(d['plan'] or '')}\n"
+        f"💰 مبلغ: {d['price']:,} تومان\n"
+        f"💳 روش پرداخت: {'کیف پول' if d['wallet'] else 'کارت‌به‌کارت'}\n"
+    )
+    if d["code"]:
+        out += f"🏷 کد تخفیف: {esc(d['code'])}\n"
+    out += f"⏱ ثبت: {d['created'] or '-'}\n"
+    if d["answered"]:
+        out += f"📬 تحویل/تأیید: {d['answered']}\n"
+    out += f"🔹 وضعیت: {status}\n\nبرای پیگیری، شمارهٔ بالا را به پشتیبانی بدهید."
+    return out
+
+
+async def send_invoice(bot, uid, req_id):
+    if not get_bool("invoice_on"):
+        return
+    text_ = invoice_text(req_id, uid)
+    if text_:
+        await gsend(bot, uid, text_)
+
+
+@dp.callback_query(F.data == CB.INV_LAST)
+async def v3_last_invoice(call: types.CallbackQuery):
+    with SessionLocal() as s:
+        r = (
+            s.query(Request.id)
+            .filter(Request.user_id == call.from_user.id, Request.req_type.in_(SALE_TYPES), Request.status == "answered")
+            .order_by(Request.id.desc())
+            .first()
+        )
+    if r is None:
+        await call.answer("هنوز خرید تکمیل‌شده‌ای ثبت نشده.", show_alert=True)
+        return
+    await call.answer()
+    b = InlineKeyboardButton
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [b(text="📜 تاریخچه تراکنش‌ها", callback_data="tx_history")],
+            [b(text="⬅️ برگشت به حساب کاربری", callback_data="back_to_account")],
+        ]
+    )
+    await edit_or_send(call, invoice_text(r[0], call.from_user.id) or "فاکتور یافت نشد.", markup)
+
+
+# ---------------------------------------------------------------------------
+# نظرات مشتریان (با رضایت کاربر و تأیید ادمین)
+# ---------------------------------------------------------------------------
+async def v3_ask_review(call, req_id, score):
+    b = InlineKeyboardButton
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                b(text="✍️ نوشتن نظر", callback_data=f"{CB.RV_WRITE}{req_id}"),
+                b(text="رد کردن", callback_data=CB.RV_SKIP),
+            ]
+        ]
+    )
+    await edit_or_send(
+        call,
+        f"🙏 ممنون از امتیازت ({score} ⭐)!\n\nاگه دوست داری یه جمله هم از تجربه‌ات بنویس. "
+        "با اجازهٔ تو، بعد از تأیید ادمین به‌صورت ناشناس (بدون اسم و آیدی) در بخش «نظرات مشتریان» نمایش داده می‌شه.",
+        markup,
+    )
+
+
+@dp.callback_query(F.data == CB.RV_SKIP)
+async def v3_review_skip(call: types.CallbackQuery):
+    await call.answer()
+    await edit_or_send(call, "🙏 ممنون از امتیازت!")
+
+
+@dp.callback_query(F.data.regexp(r"^v3_rv_\d+$"))
+async def v3_review_write(call: types.CallbackQuery, state: FSMContext):
+    req_id = int(call.data.split("_")[2])
+    with SessionLocal() as s:
+        rt = s.query(Rating).filter(Rating.request_id == req_id, Rating.user_id == call.from_user.id).first()
+        if rt is None or rt.comment:
+            await call.answer("برای این سفارش قبلاً نظر ثبت شده.", show_alert=True)
+            return
+        rid = rt.id
+    await call.answer()
+    await state.set_state(V3State.review_text)
+    await state.update_data(rating_id=rid)
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="انصراف", callback_data="main_menu")]])
+    await edit_or_send(call, "✍️ نظرت رو در یک یا دو جمله بفرست (حداکثر ۲۵۰ حرف، بدون لینک):", markup)
+
+
+@dp.message(V3State.review_text, ~F.text.in_(MENU_TEXTS))
+async def v3_review_received(message: types.Message, state: FSMContext):
+    text_ = (message.text or "").strip()
+    if len(text_) < 5 or len(text_) > 250:
+        await message.answer("نظر باید بین ۵ تا ۲۵۰ حرف باشه. دوباره بفرست:")
+        return
+    if re.search(r"https?://|t\.me|www\.|@\w", text_, re.I):
+        await message.answer("لطفاً بدون لینک و آیدی بنویس:")
+        return
+    data = await state.get_data()
+    rid = data.get("rating_id")
+    with SessionLocal() as s:
+        rt = s.get(Rating, rid) if rid else None
+        if rt is None or rt.user_id != message.from_user.id or rt.comment:
+            await state.clear()
+            await message.answer("این نظر قابل ثبت نیست.")
+            return
+        rt.comment = text_
+        rt.approved = False
+        score = rt.score
+        s.commit()
+    await state.clear()
+    await message.answer("🙏 ممنون! نظرت بعد از تأیید ادمین نمایش داده می‌شه.", reply_markup=back_home_markup())
+    await notify_staff(message.bot, f"💬 <b>نظر جدید ({score}/5)</b>\n\n«{esc(text_)}»", _review_admin_markup(rid))
+
+
+def _review_admin_markup(rating_id):
+    b = InlineKeyboardButton
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                b(text="✅ نمایش بده", callback_data=f"{CB.RV_OK}{rating_id}"),
+                b(text="🗑 رد", callback_data=f"{CB.RV_NO}{rating_id}"),
+            ]
+        ]
+    )
+
+
+@dp.callback_query(F.data.regexp(r"^v3_rva_\d+$"), Staff())
+async def v3_review_approve(call: types.CallbackQuery):
+    rid = int(call.data.split("_")[2])
+    with SessionLocal() as s:
+        rt = s.get(Rating, rid)
+        if rt is None:
+            await call.answer("یافت نشد.", show_alert=True)
+            return
+        rt.approved = True
+        s.commit()
+    _v3c.pop("social", None)
+    await call.answer("تأیید شد.")
+    await append_status(call, "✅ نمایش داده می‌شود.", None)
+
+
+@dp.callback_query(F.data.regexp(r"^v3_rvr_\d+$"), Staff())
+async def v3_review_reject(call: types.CallbackQuery):
+    rid = int(call.data.split("_")[2])
+    with SessionLocal() as s:
+        rt = s.get(Rating, rid)
+        if rt is not None:
+            rt.approved = False
+            rt.comment = None
+            s.commit()
+    await call.answer("حذف شد.")
+    await append_status(call, "🗑 رد شد.", None)
+
+
+@dp.callback_query(F.data == CB.RV_PENDING, Staff())
+async def v3_review_pending(call: types.CallbackQuery):
+    with SessionLocal() as s:
+        rows = [
+            (r.id, r.score, r.comment)
+            for r in s.query(Rating)
+            .filter(Rating.comment.isnot(None), or_(Rating.approved.is_(None), Rating.approved.is_(False)))
+            .order_by(Rating.id.desc())
+            .limit(8)
+            .all()
+        ]
+    if not rows:
+        await call.answer("نظر در انتظار تأییدی نیست.", show_alert=True)
+        return
+    await call.answer()
+    for rid, score, comment in rows:
+        await call.bot.send_message(
+            chat_id=call.from_user.id, text=f"💬 <b>({score}/5)</b>\n\n«{esc(comment or '')}»",
+            reply_markup=_review_admin_markup(rid),
+        )
+
+
+def reviews_view():
+    n = max(3, min(5, get_int("reviews_count")))
+    with SessionLocal() as s:
+        rows = [
+            (r.score, r.comment, r.created_at)
+            for r in s.query(Rating)
+            .filter(Rating.approved.is_(True), Rating.comment.isnot(None))
+            .order_by(Rating.id.desc())
+            .limit(n)
+            .all()
+        ]
+    out = "💬 <b>نظرات مشتریان</b>\n\n"
+    if not rows:
+        out += "هنوز نظری برای نمایش ثبت نشده؛ به‌زودی اینجا نظرهای واقعی مشتری‌ها رو می‌بینی 🙌"
+    for score, comment, created in rows:
+        day = (created or "").split(" ")[0]
+        out += f"{'⭐' * int(score or 0)}\n«{esc(comment or '')}»\n📅 {day}\n\n"
+    line = social_line()
+    if line:
+        out += line + "\n"
+    out += "\n<i>نظرها با اجازهٔ خود مشتری‌ها و به‌صورت ناشناس نمایش داده می‌شود.</i>"
+    b = InlineKeyboardButton
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [b(text=BTN_BUY, callback_data="main_buy")],
+            [b(text="🏠 منوی اصلی", callback_data="main_menu")],
+        ]
+    )
+    return out, markup
+
+
+@dp.callback_query(F.data == CB.REVIEWS)
+async def v3_reviews_show(call: types.CallbackQuery):
+    await call.answer()
+    out, markup = reviews_view()
+    await edit_or_send(call, out, markup)
+
+
+# ---------------------------------------------------------------------------
+# صفحهٔ وضعیت (تاریخچهٔ قطعی‌ها)
+# ---------------------------------------------------------------------------
+def v3_outage_log(down, note=""):
+    """شروع/پایان قطعی را ثبت می‌کند. (مدت قطعی بر حسب دقیقه یا None) را در پایان برمی‌گرداند."""
+    try:
+        now = iso_now_minute()
+        with SessionLocal() as s:
+            cur = s.query(OutageLog).filter(OutageLog.ended_iso.is_(None)).order_by(OutageLog.id.desc()).first()
+            if down:
+                if cur is None:
+                    s.add(OutageLog(started_iso=now, note=(note or "")[:200]))
+                    s.commit()
+                return None
+            if cur is None:
+                return None
+            cur.ended_iso = now
+            started = cur.started_iso
+            s.commit()
+        return int((datetime.strptime(now, TS_FMT) - datetime.strptime(started, TS_FMT)).total_seconds() // 60)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("outage log failed: %s", e)
+        return None
+
+
+def status_page_text(limit=8):
+    with SessionLocal() as s:
+        rows = [
+            (o.started_iso, o.ended_iso, o.note)
+            for o in s.query(OutageLog).order_by(OutageLog.id.desc()).limit(limit).all()
+        ]
+    cur = server_status_line()
+    out = "📡 <b>وضعیت سرویس‌ها</b>\n\n" + (cur + "\n\n" if cur else "")
+    if not rows:
+        out += "قطعی ثبت‌شده‌ای وجود ندارد."
+        return out
+    out += "📜 <b>تاریخچهٔ قطعی‌ها و رفع آن‌ها:</b>\n"
+    for st, en, _note in rows:
+        try:
+            start_dt = datetime.strptime(st, TS_FMT)
+        except (TypeError, ValueError):
+            continue
+        day = jdatetime.date.fromgregorian(date=start_dt.date()).strftime("%Y/%m/%d")
+        if en:
+            try:
+                mins = int((datetime.strptime(en, TS_FMT) - start_dt).total_seconds() // 60)
+            except ValueError:
+                mins = 0
+            out += f"• {day} ساعت {start_dt.strftime('%H:%M')} — رفع شد (مدت {fmt_minutes(max(1, mins))})\n"
+        else:
+            out += f"• {day} ساعت {start_dt.strftime('%H:%M')} — 🔴 در حال رفع\n"
+    return out
+
+
+@dp.callback_query(F.data == CB.STATUS)
+async def v3_status_show(call: types.CallbackQuery):
+    await call.answer()
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎧 پشتیبانی", callback_data="support_menu")],
+            [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="main_menu")],
+        ]
+    )
+    await edit_or_send(call, status_page_text(), markup)
+
+
+@dp.callback_query(F.data == CB.STATUS_POST, MainAdmin())
+async def v3_status_post(call: types.CallbackQuery):
+    try:
+        await call.bot.send_message(chat_id=channel_chat_id(), text=status_page_text(10))
+        await call.answer("✅ در کانال ارسال شد.", show_alert=True)
+    except Exception as e:  # noqa: BLE001
+        await call.answer(f"ناموفق: {e}"[:190], show_alert=True)
+
+
+async def v3_post_recovery(bot, minutes):
+    if not get_bool("status_post_on"):
+        return
+    try:
+        dur = f" (مدت {fmt_minutes(minutes)})" if minutes else ""
+        await bot.send_message(chat_id=channel_chat_id(), text=f"✅ مشکل سرورها برطرف شد{dur}. ممنون از صبوری شما 🙏")
+    except Exception as e:  # noqa: BLE001
+        logging.info("status recovery post failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# آخرین خبر کانال (از پست‌های واقعی کانال؛ ربات باید ادمین کانال باشد)
+# ---------------------------------------------------------------------------
+@dp.channel_post()
+async def v3_channel_post(post: types.Message):
+    try:
+        text_ = (post.text or post.caption or "").strip()
+        if not text_:
+            return
+        known = []
+        for key in ("post_channel", "force_join_channel", "channel_link"):
+            v = (get_setting(key) or "").strip()
+            if v:
+                known.append(v.replace("https://t.me/", "@").replace("http://t.me/", "@").replace("t.me/", "@").strip("/").lower())
+        uname = ("@" + post.chat.username.lower()) if post.chat.username else ""
+        if str(post.chat.id) in known or (uname and uname in known):
+            set_setting("last_news", text_[:300])
+            set_setting("last_news_iso", iso_now_minute())
+    except Exception as e:  # noqa: BLE001
+        logging.warning("channel post handler failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# پشتیبانی: ساعت کاری، آدرس جایگزین، ویدیو، «کمک می‌خواهم»
+# ---------------------------------------------------------------------------
+def alt_lines():
+    bot_, ch = (get_setting("alt_bot") or "").strip(), (get_setting("alt_channel") or "").strip()
+    if not bot_ and not ch:
+        return ""
+    out = ""
+    if bot_:
+        out += f"\n🤖 ربات پشتیبان: {esc(bot_)}"
+    if ch:
+        out += f"\n📢 کانال یدک: {esc(ch)}"
+    return out
+
+
+def support_extra():
+    """خطوط اضافهٔ منوی پشتیبانی: ساعت کاری و آدرس‌های جایگزین."""
+    out = ""
+    hl = support_hours_line()
+    if hl:
+        out += "\n\n" + hl
+    alt = alt_lines()
+    if alt:
+        out += "\n\n🔁 <b>اگه ربات یا کانال اصلی در دسترس نبود:</b>" + alt
+    return out
+
+
+async def send_saved_video(bot, chat_id, value, caption=None):
+    """ویدیوی ذخیره‌شده در تنظیمات (v:file_id یا a:file_id) را می‌فرستد؛ موفق → True."""
+    if not value:
+        return False
+    kind, _, fid = value.partition(":")
+    try:
+        if kind == "a":
+            await bot.send_animation(chat_id=chat_id, animation=fid, caption=caption)
+        else:
+            await bot.send_video(chat_id=chat_id, video=fid, caption=caption)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.warning("send saved video failed: %s", e)
+        return False
+
+
+@dp.callback_query(F.data == CB.HELP)
+async def v3_help(call: types.CallbackQuery):
+    await call.answer()
+    b = InlineKeyboardButton
+    text_ = (get_setting("help_text") or "").strip() or DEFAULTS["help_text"]
+    rows = [
+        [b(text="🩺 چک وضعیت سرویس من", callback_data=CB.CHK_MENU)],
+        [b(text="📲 آموزش اتصال", callback_data="guide_connect")],
+        [b(text="🎫 ارسال تیکت", callback_data="ticket_new")],
+        [b(text="🏠 منوی اصلی", callback_data="main_menu")],
+    ]
+    vid = (get_setting("help_video") or "").strip()
+    if vid:
+        await send_saved_video(call.bot, call.from_user.id, vid, caption="🎬 آموزش ۶۰ ثانیه‌ای نصب و اتصال")
+    await call.bot.send_message(chat_id=call.from_user.id, text=text_, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data == CB.MORE)
+async def v3_more(call: types.CallbackQuery):
+    await call.answer()
+    guide = (get_setting("connect_guide") or "").strip() or DEFAULTS["connect_guide"]
+    extra = (get_setting("config_extra_text") or "").strip()
+    out = esc(guide) + (("\n\n" + esc(extra)) if extra else "")
+    b = InlineKeyboardButton
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [b(text="📲 آموزش به تفکیک دستگاه", callback_data="guide_connect")],
+            [b(text="🎧 پشتیبانی", callback_data="support_menu")],
+        ]
+    )
+    await call.bot.send_message(chat_id=call.from_user.id, text=out[:4000], reply_markup=markup)
+
+
+# ---------------------------------------------------------------------------
+# «🩺 چک وضعیت سرویس من»
+# ---------------------------------------------------------------------------
+def _user_cfgs(uid, limit=8):
+    with SessionLocal() as s:
+        return [
+            (c.id, c.config_name or "سرویس", c.config_details or "", c.expires_at)
+            for c in s.query(UserConfig).filter(UserConfig.user_id == uid).order_by(UserConfig.id.desc()).limit(limit).all()
+        ]
+
+
+@dp.callback_query(F.data == CB.CHK_MENU)
+async def v3_check_menu(call: types.CallbackQuery):
+    cfgs = [c for c in _user_cfgs(call.from_user.id) if find_sub_url(c[2])]
+    if not cfgs:
+        await call.answer("سرویسی با لینک قابل بررسی ندارید.", show_alert=True)
+        return
+    await call.answer()
+    b = InlineKeyboardButton
+    rows = [[b(text=f"🩺 {name[:40]}", callback_data=f"{CB.CHK}{cid}")] for cid, name, _d, _e in cfgs]
+    rows.append([b(text="🏠 منوی اصلی", callback_data="main_menu")])
+    await edit_or_send(call, "کدوم سرویس رو چک کنم؟", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.regexp(r"^v3_chk_\d+$"))
+async def v3_check_service(call: types.CallbackQuery):
+    cid = int(call.data.split("_")[2])
+    uid = call.from_user.id
+    now = time.time()
+    if now - _chk_last.get(uid, 0) < 20:
+        await call.answer("چند ثانیه صبر کن و دوباره امتحان کن ⏳", show_alert=True)
+        return
+    _chk_last[uid] = now
+    if len(_chk_last) > 5000:
+        _chk_last.clear()
+    with SessionLocal() as s:
+        cfg = s.get(UserConfig, cid)
+        if cfg is None or cfg.user_id != uid:
+            await call.answer("سرویس یافت نشد.", show_alert=True)
+            return
+        link, name, exp = find_sub_url(cfg.config_details or ""), cfg.config_name or "سرویس", cfg.expires_at
+    if not link:
+        await call.answer("این سرویس لینک قابل بررسی ندارد؛ با پشتیبانی تماس بگیر.", show_alert=True)
+        return
+    await call.answer("در حال بررسی… ⏳")
+    res = await fetch_usage(link, force=True)
+    server_down = bool(_monitor.get("down"))
+    b = InlineKeyboardButton
+    rows = []
+    if res["ok"] and usage_is_finished(res):
+        out = f"⚠️ <b>{esc(name)}</b>\n\nلینک سالمه ولی حجم سرویست تموم شده؛ برای ادامه تمدید کن.\n\n" + usage_lines(res)
+        rows.append([b(text="🔄 تمدید", callback_data=f"renew_{cid}")])
+    elif res["ok"]:
+        out = f"✅ <b>{esc(name)}</b>\n\nلینک سرویس سالمه و از سمت سرور مشکلی نیست.\n\n" + usage_lines(res)
+        if exp:
+            out += f"📅 پایان: {jalali_from_iso(exp)}\n"
+        out += (
+            "\nاگه هنوز وصل نمی‌شی، مشکل معمولاً از برنامه یا شبکهٔ توئه:\n"
+            "• Update Subscription رو بزن\n• برنامه رو آپدیت کن\n• شبکه رو عوض کن (وای‌فای ↔ دیتا)"
+        )
+        rows.append([b(text="📲 آموزش اتصال", callback_data="guide_connect")])
+    else:
+        if server_down:
+            out = f"🔴 <b>{esc(name)}</b>\n\nمشکل از سمت سرور شناسایی شده و تیم فنی در حال رفعه. نیازی به تیکت نیست؛ خبرت می‌کنیم."
+        else:
+            out = (
+                f"⚠️ <b>{esc(name)}</b>\n\nلینک الان پاسخ نمی‌ده ({esc(str(res.get('error') or 'خطا'))}). "
+                "مشکل از سمت سرویس به نظر می‌رسه؛ به پشتیبانی هم اطلاع دادیم."
+            )
+            try:
+                with SessionLocal() as s:
+                    key = f"{cid}:{today_iran().isoformat()}:{now_naive().hour}"
+                    if not glog_has(s, uid, "chkfail", key):
+                        glog_add(s, uid, "chkfail", key)
+                        s.commit()
+                        spawn(
+                            notify_staff(
+                                call.bot,
+                                f"🩺 <b>چک وضعیت کاربر ناموفق بود</b>\n👤 <code>{uid}</code> | سرویس #{cid} ({esc(name)})\nخطا: {esc(str(res.get('error') or ''))}",
+                                InlineKeyboardMarkup(inline_keyboard=[[b(text="👤 مدیریت کاربر", callback_data=f"manage_user_{uid}")]]),
+                            )
+                        )
+            except Exception as e:  # noqa: BLE001
+                logging.warning("chk fail notify failed: %s", e)
+        rows.append([b(text="🎫 ارسال تیکت", callback_data="ticket_new")])
+    rows.append([b(text="🏠 منوی اصلی", callback_data="main_menu")])
+    await edit_or_send(call, out, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+# ---------------------------------------------------------------------------
+# پاسخ خودکار عیب‌یابی قبل از ساخت تیکت
+# ---------------------------------------------------------------------------
+async def v3_triage_intercept(message: types.Message, state: FSMContext):
+    """اگر متن تیکت شبیه «وصل نمی‌شود» بود، اول مراحل عیب‌یابی را نشان می‌دهد؛ True یعنی پیام مصرف شد."""
+    if not get_bool("trouble_on") or not message.text or message.photo or message.voice:
+        return False
+    data = await state.get_data()
+    if data.get("triaged") or data.get("ticket_id"):
+        return False
+    kws = [k.strip() for k in (get_setting("trouble_keywords") or "").split("|") if k.strip()]
+    if not kws or not re.search("|".join(re.escape(k) for k in kws), message.text, re.I):
+        return False
+    await state.update_data(triaged=True)
+    if len(_triage_msgs) > 2000:
+        _triage_msgs.clear()
+    _triage_msgs[message.from_user.id] = message
+    b = InlineKeyboardButton
+    rows = [
+        [b(text="🩺 چک وضعیت سرویس من", callback_data=CB.CHK_MENU)],
+        [b(text="📲 آموزش اتصال", callback_data="guide_connect")],
+        [b(text="✅ مشکلم حل شد", callback_data=CB.TRI_OK)],
+        [b(text="🎫 هنوز مشکل دارم؛ تیکت ثبت شود", callback_data=CB.TRI_GO)],
+    ]
+    text_ = (get_setting("trouble_text") or "").strip() or DEFAULTS["trouble_text"]
+    await message.answer(esc(text_), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    return True
+
+
+@dp.callback_query(F.data == CB.TRI_OK)
+async def v3_triage_ok(call: types.CallbackQuery, state: FSMContext):
+    await call.answer("خوشحالیم حل شد 🙌")
+    _triage_msgs.pop(call.from_user.id, None)
+    await state.clear()
+    try:
+        with SessionLocal() as s:
+            glog_add(s, call.from_user.id, "triage_ok", today_iran().isoformat())
+            s.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("triage log failed: %s", e)
+    await edit_or_send(call, "🙌 عالیه! اگه بازم مشکلی بود همین‌جا هستیم.", back_home_markup())
+
+
+@dp.callback_query(F.data == CB.TRI_GO)
+async def v3_triage_go(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    msg = _triage_msgs.pop(call.from_user.id, None)
+    if msg is None:
+        await state.set_state(PaymentState.ticket_waiting_text)
+        await state.update_data(ticket_id=None, triaged=True)
+        await edit_or_send(call, "✍️ مشکلت رو دوباره بنویس تا تیکت ثبت بشه:")
+        return
+    await state.set_state(PaymentState.ticket_waiting_text)
+    await state.update_data(triaged=True)
+    await ticket_text_received(msg, state)
+
+
+# ---------------------------------------------------------------------------
+# پاسخ‌های آماده برای ادمین (زیر هر تیکت)
+# ---------------------------------------------------------------------------
+def canned_list():
+    out = []
+    for line in (get_setting("canned_replies") or "").splitlines():
+        if "|" not in line:
+            continue
+        label, _, body = line.partition("|")
+        label, body = label.strip(), body.strip()
+        if label and body:
+            out.append((label[:30], body))
+    return out[:6]
+
+
+def canned_rows(tid):
+    if not get_bool("canned_on"):
+        return []
+    items = canned_list()
+    btns = [InlineKeyboardButton(text=f"⚡ {lbl}", callback_data=f"{CB.CANNED}{tid}_{i}") for i, (lbl, _b) in enumerate(items)]
+    return [btns[i : i + 2] for i in range(0, len(btns), 2)]
+
+
+@dp.callback_query(F.data.regexp(r"^v3_cn_\d+_\d+$"), Staff())
+async def v3_canned_send(call: types.CallbackQuery):
+    _, _, tid_s, idx_s = call.data.split("_")
+    tid, idx = int(tid_s), int(idx_s)
+    items = canned_list()
+    if idx >= len(items):
+        await call.answer("این پاسخ دیگر وجود ندارد.", show_alert=True)
+        return
+    body = items[idx][1]
+    with SessionLocal() as s:
+        t = s.get(Ticket, tid)
+        if t is None:
+            await call.answer("تیکت یافت نشد.", show_alert=True)
+            return
+        uid = t.user_id
+        s.add(TicketMessage(ticket_id=tid, sender="staff", text=body, created_at=get_current_jalali()))
+        s.commit()
+    b = InlineKeyboardButton
+    markup = InlineKeyboardMarkup(inline_keyboard=[[b(text="↩️ پاسخ به پشتیبانی", callback_data=f"ticket_ureply_{tid}")]])
+    try:
+        await call.bot.send_message(chat_id=uid, text=f"💬 پاسخ پشتیبانی به تیکت #{tid}:\n\n{esc(body)}", reply_markup=markup)
+        await call.answer("✅ ارسال شد.")
+        log_action(call.from_user.id, f"پاسخ آماده به تیکت #{tid}")
+        await append_status(call, f"⚡ پاسخ آماده ارسال شد: {esc(items[idx][0])}", None)
+    except Exception as e:  # noqa: BLE001
+        await call.answer(f"ارسال ناموفق: {err_text(e)}"[:190], show_alert=True)
+
+
+# ---------------------------------------------------------------------------
+# ارسال آدرس‌های جایگزین به همهٔ کاربران (از طریق همان broadcast_text)
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data == CB.ALT_ASK, MainAdmin())
+async def v3_alt_ask(call: types.CallbackQuery):
+    alt = alt_lines()
+    if not alt:
+        await call.answer("اول ربات پشتیبان یا کانال یدک را تنظیم کنید.", show_alert=True)
+        return
+    await call.answer()
+    b = InlineKeyboardButton
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [b(text="✅ ارسال برای همه", callback_data=CB.ALT_GO)],
+            [b(text="❌ انصراف", callback_data="spage_supp2")],
+        ]
+    )
+    text_ = (get_setting("alt_text") or "").strip() or DEFAULTS["alt_text"]
+    await edit_or_send(call, "پیش‌نمایش پیامی که برای <b>همهٔ کاربران</b> می‌رود:\n\n" + text_ + alt, markup)
+
+
+@dp.callback_query(F.data == CB.ALT_GO, MainAdmin())
+async def v3_alt_go(call: types.CallbackQuery):
+    text_ = ((get_setting("alt_text") or "").strip() or DEFAULTS["alt_text"]) + alt_lines()
+    spawn(broadcast_text(call.bot, text_))
+    log_action(call.from_user.id, "ارسال آدرس‌های جایگزین به همه")
+    await call.answer("ارسال برای همه کاربران آغاز شد.", show_alert=True)
+
+
+# ---------------------------------------------------------------------------
+# «❓ سؤال دارم» در صفحهٔ پرداخت: سفارش نیمه‌کاره به تیکت پیوست می‌شود
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data == CB.PAYHELP, PaymentState.waiting_for_receipt)
+async def v3_payhelp(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    co = compute_checkout(call.from_user.id, data)
+    if co is None:
+        await call.answer("این سفارش دیگه معتبر نیست.", show_alert=True)
+        return
+    await call.answer()
+    await state.update_data(payhelp=True)
+    await call.bot.send_message(
+        chat_id=call.from_user.id,
+        text="❓ سؤالت رو همین‌جا بنویس (متن). سفارش نیمه‌کاره‌ات خودکار به تیکت پیوست می‌شه و پرداختت هم سر جاشه؛ بعد از ارسال سؤال می‌تونی ادامه بدی.",
+    )
+
+
+async def v3_payhelp_question(message: types.Message, state: FSMContext):
+    """سؤال متنی کاربر در مرحلهٔ پرداخت؛ تیکت با پیوست سفارش ساخته می‌شود (state پرداخت حفظ می‌شود)."""
+    data = await state.get_data()
+    co = compute_checkout(message.from_user.id, data)
+    q = (message.text or "").strip()
+    if not q:
+        return
+    attach = ""
+    if co is not None:
+        attach = f"\n\n📎 سفارش نیمه‌کاره: {co['label']} | {co['final']:,} تومان"
+    with SessionLocal() as s:
+        t = Ticket(user_id=message.from_user.id, status="open", created_at=get_current_jalali())
+        s.add(t)
+        s.flush()
+        tid = t.id
+        s.add(TicketMessage(ticket_id=tid, sender="user", text=q + attach, created_at=get_current_jalali()))
+        s.commit()
+    await state.update_data(payhelp=False)
+    await message.answer(f"✅ سؤالت با شمارهٔ #{tid} ثبت شد و جوابش همین‌جا میاد. می‌تونی پرداختت رو ادامه بدی 🙌")
+    b = InlineKeyboardButton
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[b(text="💬 پاسخ", callback_data=f"ticket_reply_{tid}"), b(text="✅ بستن تیکت", callback_data=f"ticket_close_{tid}")]]
+        + canned_rows(tid)
+    )
+    await notify_staff(
+        message.bot,
+        f"🎫 تیکت #{tid} از {user_label(message.from_user)} ({message.from_user.id}) — از صفحهٔ پرداخت:\n\n{esc(q)}{esc(attach)}",
+        markup,
+    )
+
+
+# ---------------------------------------------------------------------------
+# بعد از تحویل: فاکتور، «وصل شدم / وصل نشدم»، سپس نظرسنجی
+# ---------------------------------------------------------------------------
+async def v3_post_delivery(bot, uid, req_id):
+    """جایگزین فراخوانی مستقیم send_rating_request بعد از تحویل/تمدید."""
+    try:
+        await send_invoice(bot, uid, req_id)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("invoice send failed: %s", e)
+    if get_bool("connect_check_on"):
+        b = InlineKeyboardButton
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    b(text="✅ وصل شدم", callback_data=f"{CB.CK_OK}{req_id}"),
+                    b(text="❌ وصل نشدم", callback_data=f"{CB.CK_NO}{req_id}"),
+                ]
+            ]
+        )
+        await gsend(bot, uid, "🔌 خب، با آموزش وصل شدی؟", markup)
+        return
+    await send_rating_request(bot, uid, req_id)
+
+
+@dp.callback_query(F.data.regexp(r"^v3_ckok_\d+$"))
+async def v3_connect_ok(call: types.CallbackQuery):
+    req_id = int(call.data.split("_")[2])
+    await call.answer("عالی! 🎉")
+    try:
+        with SessionLocal() as s:
+            if not glog_has(s, call.from_user.id, "ck_ok", req_id):
+                glog_add(s, call.from_user.id, "ck_ok", req_id)
+                s.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("ck_ok log failed: %s", e)
+    await edit_or_send(call, "🎉 عالیه! لذت ببر 🙌")
+    await send_rating_request(call.bot, call.from_user.id, req_id)
+
+
+@dp.callback_query(F.data.regexp(r"^v3_ckno_\d+$"))
+async def v3_connect_no(call: types.CallbackQuery):
+    req_id = int(call.data.split("_")[2])
+    uid = call.from_user.id
+    await call.answer()
+    try:
+        with SessionLocal() as s:
+            if not glog_has(s, uid, "ck_no", req_id):
+                glog_add(s, uid, "ck_no", req_id)
+                s.commit()
+        b = InlineKeyboardButton
+        spawn(
+            notify_staff(
+                call.bot,
+                f"🔌 <b>کاربر وصل نشده است</b>\n👤 <code>{uid}</code> | سفارش #{req_id}\nقبل از نظر منفی پیگیری کنید.",
+                InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [b(text="✉️ پیام به کاربر", callback_data=f"pm_{uid}"), b(text="👤 مدیریت کاربر", callback_data=f"manage_user_{uid}")]
+                    ]
+                ),
+            )
+        )
+    except Exception as e:  # noqa: BLE001
+        logging.warning("ck_no notify failed: %s", e)
+    b = InlineKeyboardButton
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [b(text="🩺 چک وضعیت سرویس من", callback_data=CB.CHK_MENU)],
+            [b(text="📲 آموزش اتصال", callback_data="guide_connect")],
+            [b(text="🆘 کمک می‌خواهم", callback_data=CB.HELP)],
+            [b(text="🎫 ارسال تیکت", callback_data="ticket_new")],
+        ]
+    )
+    await edit_or_send(call, "😕 ناراحت شدیم! یه چند قدم ساده رو امتحان کن؛ پشتیبانی هم باخبر شد و پیگیری می‌کنه:", markup)
+
+
+# ---------------------------------------------------------------------------
+# پیگیری ۲۴ ساعته، نظرسنجی ۷ روزه
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data.regexp(r"^v3_fuok_\d+$"))
+async def v3_followup_ok(call: types.CallbackQuery):
+    await call.answer("ممنون! 🙌")
+    await edit_or_send(call, "🙌 خوشحالیم که همه‌چیز خوبه!")
+
+
+@dp.callback_query(F.data.regexp(r"^v3_fubad_\d+$"))
+async def v3_followup_bad(call: types.CallbackQuery):
+    req_id = int(call.data.split("_")[2])
+    uid = call.from_user.id
+    await call.answer()
+    b = InlineKeyboardButton
+    spawn(
+        notify_staff(
+            call.bot,
+            f"⚠️ <b>پیگیری ۲۴ ساعته: کاربر مشکل دارد</b>\n👤 <code>{uid}</code> | سفارش #{req_id}",
+            InlineKeyboardMarkup(inline_keyboard=[[b(text="✉️ پیام به کاربر", callback_data=f"pm_{uid}")]]),
+        )
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [b(text="🩺 چک وضعیت سرویس من", callback_data=CB.CHK_MENU)],
+            [b(text="🆘 کمک می‌خواهم", callback_data=CB.HELP)],
+            [b(text="🎫 ارسال تیکت", callback_data="ticket_new")],
+        ]
+    )
+    await edit_or_send(call, "😕 متأسفیم! پشتیبانی باخبر شد. تا اون موقع این‌ها رو امتحان کن:", markup)
+
+
+@dp.callback_query(F.data.regexp(r"^v3_s7_\d+_[1-5]$"))
+async def v3_survey7_answer(call: types.CallbackQuery):
+    _, _, rid_s, score_s = call.data.split("_")
+    req_id, score = int(rid_s), int(score_s)
+    uid = call.from_user.id
+    with SessionLocal() as s:
+        r = s.get(Request, req_id)
+        if r is None or r.user_id != uid:
+            await call.answer("یافت نشد.", show_alert=True)
+            return
+        if s.query(GrowthLog.id).filter(GrowthLog.user_id == uid, GrowthLog.kind == "s7score", GrowthLog.ref.like(f"{req_id}:%")).first():
+            await call.answer("قبلاً ثبت شده.", show_alert=True)
+            return
+        glog_add(s, uid, "s7score", f"{req_id}:{score}")
+        s.commit()
+    await call.answer()
+    if score <= get_int("rating_low_max"):
+        b = InlineKeyboardButton
+        spawn(
+            notify_staff(
+                call.bot,
+                f"⚠️ <b>نظرسنجی ۷ روزه: امتیاز پایین {score}/5</b>\n👤 <code>{uid}</code> | سفارش #{req_id}",
+                InlineKeyboardMarkup(inline_keyboard=[[b(text="✉️ پیام به کاربر", callback_data=f"pm_{uid}")]]),
+            )
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎫 ارسال تیکت", callback_data="ticket_new")]])
+        await edit_or_send(call, f"🙏 ممنون از صداقتت ({score} ⭐). بگو چی اذیتت کرده تا درستش کنیم:", markup)
+    else:
+        await edit_or_send(call, f"🙏 ممنون از امتیازت ({score} ⭐)!")
+
+
+async def job_v3_followups(bot):
+    """هر چند دقیقه: پیگیری ۲۴ ساعته و نظرسنجی ۷ روزه برای سفارش‌های تحویل‌شده."""
+    now = now_naive()
+    b = InlineKeyboardButton
+    todo = []
+    with SessionLocal() as s:
+        if get_bool("followup24_on"):
+            hi, lo = dt_to_jalali_str(now - timedelta(hours=24)), dt_to_jalali_str(now - timedelta(hours=72))
+            rows = (
+                s.query(Request.id, Request.user_id)
+                .filter(
+                    Request.status == "answered", Request.req_type.in_(["buy", "renew"]), Request.price > 0,
+                    Request.answered_at <= hi, Request.answered_at >= lo,
+                )
+                .order_by(Request.id.desc())
+                .limit(40)
+                .all()
+            )
+            for rid, uid in rows:
+                if glog_has(s, uid, "fu24", rid) or glog_has(s, uid, "ck_no", rid):
+                    continue
+                glog_add(s, uid, "fu24", rid)
+                todo.append((uid, (get_setting("followup24_text") or DEFAULTS["followup24_text"]),
+                             InlineKeyboardMarkup(inline_keyboard=[[
+                                 b(text="👍 همه‌چیز خوبه", callback_data=f"{CB.FU_OK}{rid}"),
+                                 b(text="🆘 مشکل دارم", callback_data=f"{CB.FU_BAD}{rid}"),
+                             ]])))
+        if get_bool("survey7_on"):
+            hi, lo = dt_to_jalali_str(now - timedelta(days=7)), dt_to_jalali_str(now - timedelta(days=21))
+            rows = (
+                s.query(Request.id, Request.user_id)
+                .filter(
+                    Request.status == "answered", Request.req_type.in_(["buy", "renew"]), Request.price > 0,
+                    Request.answered_at <= hi, Request.answered_at >= lo,
+                )
+                .order_by(Request.id.desc())
+                .limit(40)
+                .all()
+            )
+            for rid, uid in rows:
+                if glog_has(s, uid, "sv7", rid):
+                    continue
+                glog_add(s, uid, "sv7", rid)
+                todo.append((uid, (get_setting("survey7_text") or DEFAULTS["survey7_text"]),
+                             InlineKeyboardMarkup(inline_keyboard=[[b(text=f"{n} ⭐", callback_data=f"{CB.S7}{rid}_{n}") for n in range(1, 6)]])))
+        s.commit()
+    for uid, text_, markup in todo:
+        await gsend(bot, uid, esc(text_), markup)
+        await asyncio.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# افزونه (Add-on): حجم یا روز اضافه بدون تعویض پلن
+# ---------------------------------------------------------------------------
+def parse_addons():
+    out = []
+    for line in (get_setting("addons") or "").translate(DIGITS_FA).splitlines():
+        m = re.fullmatch(r"\s*(gb|day)\s*:\s*(\d+)\s*:\s*(\d+)\s*", line, re.I)
+        if m and int(m.group(2)) > 0 and int(m.group(3)) > 0:
+            out.append((m.group(1).lower(), int(m.group(2)), int(m.group(3))))
+    return out[:6]
+
+
+def addon_label(kind, amount):
+    return f"➕ افزونه حجم: {amount} گیگ" if kind == "gb" else f"➕ افزونه زمان: {amount} روز"
+
+
+def v3_apply_addon(cfg, plan):
+    """افزونهٔ تأییدشده را اعمال می‌کند؛ برای «روز» تاریخ انقضا خودکار تمدید می‌شود. متن گزارش را برمی‌گرداند."""
+    m = re.search(r"(\d+)\s*روز", (plan or "").translate(DIGITS_FA))
+    if m:
+        days = int(m.group(1))
+        try:
+            cur = date.fromisoformat(cfg.expires_at) if cfg.expires_at else today_iran()
+        except ValueError:
+            cur = today_iran()
+        new_exp = max(cur, today_iran()) + timedelta(days=days)
+        cfg.expires_at = new_exp.isoformat()
+        cfg.reminded = False
+        return f"📅 {days} روز به سرویس اضافه شد؛ تاریخ پایان جدید: {jalali_from_iso(new_exp.isoformat())}"
+    g = re.search(r"(\d+)\s*گیگ", (plan or "").translate(DIGITS_FA))
+    amt = g.group(1) if g else "؟"
+    return f"📦 {amt} گیگ حجم اضافه تأیید شد (حجم را در پنل سرویس اعمال کنید)"
+
+
+@dp.callback_query(F.data.regexp(r"^v3_ad_\d+$"))
+async def v3_addon_menu(call: types.CallbackQuery):
+    cid = int(call.data.split("_")[2])
+    items = parse_addons()
+    with SessionLocal() as s:
+        cfg = s.get(UserConfig, cid)
+        ok = cfg is not None and cfg.user_id == call.from_user.id
+        name = (cfg.config_name if cfg else "") or "سرویس"
+    if not ok or not get_bool("addon_on") or not items:
+        await call.answer("افزونه‌ای برای این سرویس در دسترس نیست.", show_alert=True)
+        return
+    await call.answer()
+    b = InlineKeyboardButton
+    rows = [
+        [b(text=f"{addon_label(k, a)} — {p:,} تومان", callback_data=f"{CB.ADDON_PICK}{cid}_{i}")]
+        for i, (k, a, p) in enumerate(items)
+    ]
+    rows.append([b(text="⬅️ برگشت", callback_data="my_services_callback")])
+    await edit_or_send(
+        call,
+        f"➕ <b>افزونه برای «{esc(name)}»</b>\n\nبدون تعویض پلن، فقط همین مقدار رو اضافه کن 👇",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+def _addon_ctx(call, cid, idx):
+    items = parse_addons()
+    if idx >= len(items) or not get_bool("addon_on"):
+        return None
+    with SessionLocal() as s:
+        cfg = s.get(UserConfig, cid)
+        if cfg is None or cfg.user_id != call.from_user.id:
+            return None
+        u = s.get(User, call.from_user.id)
+        bal = (u.balance if u else 0) or 0
+    k, a, p = items[idx]
+    return dict(kind=k, amount=a, price=p, label=addon_label(k, a), balance=bal)
+
+
+@dp.callback_query(F.data.regexp(r"^v3_adp_\d+_\d+$"))
+async def v3_addon_pick(call: types.CallbackQuery):
+    _, _, cid_s, idx_s = call.data.split("_")
+    cid, idx = int(cid_s), int(idx_s)
+    ctx = _addon_ctx(call, cid, idx)
+    if ctx is None:
+        await call.answer("این افزونه دیگر در دسترس نیست.", show_alert=True)
+        return
+    await call.answer()
+    b = InlineKeyboardButton
+    rows = []
+    out = f"{esc(ctx['label'])}\n💰 مبلغ: <b>{ctx['price']:,}</b> تومان\n💳 موجودی کیف پول: {ctx['balance']:,} تومان\n"
+    if ctx["balance"] >= ctx["price"]:
+        rows.append([b(text="💳 پرداخت از کیف پول", callback_data=f"{CB.ADDON_WALLET}{cid}_{idx}")])
+    rows.append([b(text="🏦 کارت‌به‌کارت", callback_data=f"{CB.ADDON_CARD}{cid}_{idx}")])
+    rows.append([b(text="⬅️ برگشت", callback_data=f"{CB.ADDON}{cid}")])
+    await edit_or_send(call, out + trust_footer(), InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+async def _notify_addon_request(bot, user, req_id, ctx, how, receipt=None):
+    text_ = (
+        f"🚨 درخواست افزونه {how} (کد #{req_id})\n👤 کاربر: {user_label(user)} ({user.id})\n"
+        f"📦 {esc(ctx['label'])}\n💰 مبلغ: {ctx['price']:,} تومان\n⏱ {get_current_jalali()}"
+    )
+    await notify_staff(bot, text_, admin_request_markup(req_id), photo=receipt)
+
+
+@dp.callback_query(F.data.regexp(r"^v3_adw_\d+_\d+$"))
+async def v3_addon_wallet(call: types.CallbackQuery):
+    _, _, cid_s, idx_s = call.data.split("_")
+    cid, idx = int(cid_s), int(idx_s)
+    uid = call.from_user.id
+    ctx = _addon_ctx(call, cid, idx)
+    if ctx is None:
+        await call.answer("این افزونه دیگر در دسترس نیست.", show_alert=True)
+        return
+    async with user_lock(uid):
+        with SessionLocal() as s:
+            u = get_or_create_user(s, uid)
+            bal = u.balance or 0
+            if bal < ctx["price"]:
+                await call.answer("موجودی کافی نیست.", show_alert=True)
+                return
+            req = Request(
+                user_id=uid, req_type="addon", plan_name=ctx["label"], status="unanswered",
+                created_at=get_current_jalali(), created_iso=iso_now_minute(), price=ctx["price"],
+                paid_wallet=True, config_id=cid,
+            )
+            s.add(req)
+            s.flush()
+            u.balance = bal - ctx["price"]
+            wlog(s, uid, bal, u.balance, "wallet_addon", req.id)
+            req_id = req.id
+            s.commit()
+    await call.answer()
+    await edit_or_send(
+        call, fill_text("t_wallet_paid") + "\n\n" + pending_notice(), status_markup(req_id)
+    )
+    await _notify_addon_request(call.bot, call.from_user, req_id, ctx, "با کیف پول")
+
+
+@dp.callback_query(F.data.regexp(r"^v3_adc_\d+_\d+$"))
+async def v3_addon_card(call: types.CallbackQuery, state: FSMContext):
+    _, _, cid_s, idx_s = call.data.split("_")
+    cid, idx = int(cid_s), int(idx_s)
+    ctx = _addon_ctx(call, cid, idx)
+    if ctx is None:
+        await call.answer("این افزونه دیگر در دسترس نیست.", show_alert=True)
+        return
+    await call.answer()
+    await state.clear()
+    await state.set_state(V3State.addon_receipt)
+    await state.update_data(ad_cid=cid, ad_idx=idx)
+    card, holder = pick_card(call.from_user.id)
+    out = (
+        f"{esc(ctx['label'])}\n💰 مبلغ قابل پرداخت: <b>{ctx['price']:,}</b> تومان\n\n"
+        f"💳 شماره کارت:\n<code>{esc(card)}</code>\n"
+        + (v3_pay_holder_line(holder))
+        + "\n\nبعد از واریز، <b>عکس رسیدت</b> رو همین‌جا بفرست 📸"
+        + trust_footer()
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ انصراف", callback_data="main_menu")]])
+    await edit_or_send(call, out, markup)
+
+
+@dp.message(V3State.addon_receipt)
+async def v3_addon_receipt(message: types.Message, state: FSMContext):
+    if message.text and message.text in MENU_TEXTS:
+        raise SkipHandler()
+    if not has_receipt_media(message):
+        await message.answer("عکس رسیدت رو همین‌جا بفرست 📸")
+        return
+    uid = message.from_user.id
+    async with user_lock(uid):
+        if await state.get_state() != V3State.addon_receipt.state:
+            return
+        data = await state.get_data()
+        cid, idx = data.get("ad_cid"), data.get("ad_idx")
+        items = parse_addons()
+        if cid is None or idx is None or idx >= len(items):
+            await state.clear()
+            await message.answer("این سفارش دیگه معتبر نیست.")
+            return
+        k, a, p = items[idx]
+        ctx = dict(kind=k, amount=a, price=p, label=addon_label(k, a))
+        media = receipt_media(message)
+        uniq, digest = await receipt_fingerprint(message.bot, media)
+        dup = None
+        with SessionLocal() as s:
+            cfg = s.get(UserConfig, cid)
+            if cfg is None or cfg.user_id != uid:
+                await state.clear()
+                await message.answer("سرویس یافت نشد.")
+                return
+            dup = safe_find_duplicate(s, uniq, digest)
+            if dup is None:
+                req = Request(
+                    user_id=uid, req_type="addon", plan_name=ctx["label"], status="unanswered",
+                    created_at=get_current_jalali(), created_iso=iso_now_minute(), price=p,
+                    paid_wallet=False, config_id=cid, receipt_file_id=media.file_id,
+                )
+                s.add(req)
+                s.flush()
+                safe_save_fingerprint(s, uniq, digest, uid, req.id)
+                req_id = req.id
+                s.commit()
+        if dup is not None:
+            await handle_duplicate_receipt(message, dup)
+            return
+        await state.clear()
+    await message.answer(
+        fill_text("t_receipt_ok", date=get_current_jalali()) + "\n\n" + pending_notice(), reply_markup=status_markup(req_id)
+    )
+    await _notify_addon_request(message.bot, message.from_user, req_id, ctx, "با رسید", receipt=media.file_id)
+
+
+async def v3_addon_confirmed(call, uid, plan, info, extra, markup, req_id):
+    await append_status(call, f"✅ وضعیت: افزونه تأیید شد.\n{info}", markup)
+    try:
+        await call.bot.send_message(chat_id=uid, text=f"✅ {esc(plan or '')} با موفقیت فعال شد.\n{info.split('(')[0].strip()}")
+    except Exception as e:  # noqa: BLE001
+        logging.error("notify addon failed: %s", e)
+    await post_purchase_notifications(call.bot, uid, extra[0], extra[1])
+    await send_invoice(call.bot, uid, req_id)
+
+
+# ---------------------------------------------------------------------------
+# آپسل هوشمند و پیشنهاد پلن ارزان‌تر بر اساس مصرف واقعی
+# ---------------------------------------------------------------------------
+def _per_gb(price, gb):
+    return int(round(price / gb)) if gb else 0
+
+
+async def v3_upsell(bot, uid, req_id):
+    """بعد از N تمدید پشت‌سرهم یک پلن، پلن بزرگ‌تر به‌صرفه‌تر را (با محاسبهٔ هر گیگ) پیشنهاد می‌دهد."""
+    if not get_bool("upsell_on"):
+        return
+    need = max(2, get_int("upsell_renews"))
+    with SessionLocal() as s:
+        r = s.get(Request, req_id)
+        if r is None or not r.config_id:
+            return
+        cfg = s.get(UserConfig, r.config_id)
+        if cfg is None or cfg.user_id != uid or glog_has(s, uid, "upsell", cfg.id):
+            return
+        last = (
+            s.query(Request.plan_name)
+            .filter(Request.config_id == cfg.id, Request.req_type == "renew", Request.status == "answered")
+            .order_by(Request.id.desc())
+            .limit(need)
+            .all()
+        )
+        if len(last) < need or len({p for (p,) in last}) != 1:
+            return
+        svc = s.get(Service, cfg.service_id) if cfg.service_id else None
+        gb = _plan_gb(svc.name) if svc else None
+        if not svc or not gb:
+            return
+        cands = [
+            (x.id, x.name, x.price, _plan_gb(x.name))
+            for x in s.query(Service).filter(Service.category == svc.category).all()
+        ]
+        cands = [c for c in cands if c[3] and c[3] > gb and _per_gb(c[2], c[3]) < _per_gb(svc.price, gb)]
+        if not cands:
+            return
+        best = min(cands, key=lambda c: c[3])
+        cfg_id, old_name, old_price = cfg.id, svc.name, svc.price
+        glog_add(s, uid, "upsell", cfg_id)
+        s.commit()
+    nid, nname, nprice, ngb = best
+    old_pg, new_pg = _per_gb(old_price, gb), _per_gb(nprice, ngb)
+    saving = int(round((1 - new_pg / old_pg) * 100)) if old_pg else 0
+    text_ = (
+        f"💡 <b>پیشنهاد صرفه‌جویی</b>\n\nچند بار پشت‌سرهم «{esc(old_name)}» رو تمدید کردی. "
+        f"پلن «{esc(nname)}» برات به‌صرفه‌تره:\n\n"
+        f"• {esc(old_name)}: هر گیگ {old_pg:,} تومان\n"
+        f"• {esc(nname)}: هر گیگ {new_pg:,} تومان ({saving}٪ ارزان‌تر)\n\n"
+        f"فقط {nprice - old_price:,} تومان بیشتر، {ngb - gb} گیگ حجم بیشتر."
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=f"🔄 تمدید با {nname[:30]}", callback_data=f"{CB.UPSELL_RENEW}{cfg_id}_{nid}")]]
+    )
+    await gsend(bot, uid, text_, markup)
+
+
+@dp.callback_query(F.data.regexp(r"^v3_rn_\d+_\d+$"))
+async def v3_renew_with_plan(call: types.CallbackQuery, state: FSMContext):
+    _, _, cid_s, sid_s = call.data.split("_")
+    cid, sid = int(cid_s), int(sid_s)
+    with SessionLocal() as s:
+        cfg = s.get(UserConfig, cid)
+        ok = cfg is not None and cfg.user_id == call.from_user.id and s.get(Service, sid) is not None
+    if not ok:
+        await call.answer("این پیشنهاد دیگر معتبر نیست.", show_alert=True)
+        return
+    await call.answer()
+    await state.clear()
+    await state.set_state(PaymentState.waiting_for_receipt)
+    await state.update_data(service_id=sid, renew_cfg_id=cid, code=None)
+    await send_checkout(call, state, call.from_user.id)
+
+
+async def job_v3_downsell(bot):
+    """نزدیک تمدید: اگر مصرف واقعی خیلی کمتر از حجم پلن بود، پلن ارزان‌تر (کافی برای مصرف) پیشنهاد می‌دهد."""
+    if not get_bool("downsell_on"):
+        return
+    today = today_iran()
+    pct = max(10, get_int("downsell_pct"))
+    month = today.strftime("%Y-%m")
+    with SessionLocal() as s:
+        cfgs = [
+            (c.id, c.user_id, c.config_details, c.service_id)
+            for c in s.query(UserConfig)
+            .filter(UserConfig.expires_at.isnot(None), UserConfig.expires_at >= today.isoformat(),
+                    UserConfig.expires_at <= (today + timedelta(days=4)).isoformat())
+            .limit(60)
+            .all()
+        ]
+    for cid, uid, details, sid in cfgs:
+        link = find_sub_url(details)
+        if not link or not sid:
+            continue
+        with SessionLocal() as s:
+            if glog_has(s, uid, "down", f"{cid}:{month}"):
+                continue
+        u = await fetch_usage(link)
+        await asyncio.sleep(0.3)
+        if not (u.get("ok") and u.get("has_info") and u.get("total", 0) > 0):
+            continue
+        total_gb, used_gb = u["total"] / 1024**3, u["used"] / 1024**3
+        if used_gb >= total_gb * pct / 100:
+            continue
+        with SessionLocal() as s:
+            svc = s.get(Service, sid)
+            if svc is None:
+                continue
+            cands = [
+                (x.id, x.name, x.price, _plan_gb(x.name))
+                for x in s.query(Service).filter(Service.category == svc.category, Service.price < svc.price).all()
+            ]
+            cands = [c for c in cands if c[3] and c[3] >= max(1.0, used_gb * 1.3)]
+            if not cands:
+                continue
+            best = min(cands, key=lambda c: c[2])  # ارزان‌ترین پلنی که مصرف واقعی را پوشش می‌دهد
+            glog_add(s, uid, "down", f"{cid}:{month}")
+            s.commit()
+            old_name, old_price = svc.name, svc.price
+        nid, nname, nprice, _ngb = best
+        text_ = (
+            f"📉 <b>پیشنهاد صادقانه</b>\n\nتو این دوره فقط {fa(round(used_gb, 1))} گیگ از {fa(round(total_gb, 1))} گیگ "
+            f"پلنت رو مصرف کردی. پلن «{esc(nname)}» برای مصرف تو کافیه و "
+            f"{old_price - nprice:,} تومان ارزان‌تره."
+        )
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text=f"🔄 تمدید با {nname[:30]}", callback_data=f"{CB.UPSELL_RENEW}{cid}_{nid}")]]
+        )
+        await gsend(bot, uid, text_, markup)
+
+
+# ---------------------------------------------------------------------------
+# دفتر کل کیف پول و تطبیق شبانه
+# ---------------------------------------------------------------------------
+WL_REASONS = {
+    "wallet_purchase": "خرید با کیف پول", "wallet_addon": "خرید افزونه با کیف پول", "referral_reward": "پاداش دعوت",
+    "invitee_reward": "هدیهٔ دعوت‌شده", "charge_confirmed": "شارژ تأییدشده", "refund_rejected": "بازگشت وجه (رد سفارش)",
+    "admin_adjust": "تغییر دستی ادمین", "club_redeem": "تبدیل امتیاز باشگاه", "delay_compensation": "جبران تأخیر",
+    "gift_code": "کد هدیه", "transfer_out": "انتقال به کاربر", "transfer_in": "دریافت انتقال", "lottery": "جایزه قرعه‌کشی",
+    "baseline_fix": "اصلاح مبنا (ادمین)",
+}
+
+
+def reconcile_ledger():
+    """مغایرت‌های کیف پول را برمی‌گرداند: [(نوع, آیدی, مقدار الف, مقدار ب)]؛ همچنین (کاربران دفتر, ردیف‌ها)."""
+    issues, seen = [], set()
+    with SessionLocal() as s:
+        for uid, bal in s.query(User.user_id, User.balance).filter(User.balance < 0).all():
+            issues.append(("negative", uid, bal, None))
+            seen.add(uid)
+        prev, rows_n = {}, 0
+        for uid, _id, before, after in s.query(WalletTx.user_id, WalletTx.id, WalletTx.before, WalletTx.after).order_by(
+            WalletTx.user_id, WalletTx.id
+        ).yield_per(2000):
+            rows_n += 1
+            p = prev.get(uid)
+            if p is not None and p != before and uid not in seen:
+                issues.append(("chain", uid, before, p))
+                seen.add(uid)
+            prev[uid] = after
+        for uid, bal in s.query(User.user_id, User.balance).all():
+            if uid in prev and prev[uid] != (bal or 0) and uid not in seen:
+                issues.append(("mismatch", uid, bal or 0, prev[uid]))
+                seen.add(uid)
+    return issues, len(prev), rows_n
+
+
+def _issue_line(kind, uid, a, b_):
+    if kind == "negative":
+        return f"🔴 موجودی منفی: <code>{uid}</code> ({a:,})"
+    if kind == "chain":
+        return f"🟠 ردیف‌های دفتر پیوسته نیست: <code>{uid}</code>"
+    return f"🟠 موجودی <code>{uid}</code> = {a:,} ولی آخرین ردیف دفتر = {b_:,}"
+
+
+def _reconcile_report(issues, n_users, n_rows):
+    if not issues:
+        return f"✅ تطبیق کیف پول: همه‌چیز می‌خواند ({n_users} کاربر در دفتر، {n_rows} ردیف).", None
+    b = InlineKeyboardButton
+    out = f"⚠️ <b>مغایرت موجودی کیف پول: {len(issues)} مورد</b>\n\n" + "\n".join(_issue_line(*i) for i in issues[:15])
+    rows = [[b(text=f"📒 دفتر کل {i[1]}", callback_data=f"{CB.WL}{i[1]}")] for i in issues[:8]]
+    return out, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def job_reconcile(bot):
+    if not get_bool("reconcile_on"):
+        return
+    issues, n_users, n_rows = await asyncio.to_thread(reconcile_ledger)
+    if issues:
+        text_, markup = _reconcile_report(issues, n_users, n_rows)
+        await gsend(bot, ADMIN_ID, text_, markup)
+    else:
+        logging.info("wallet reconcile ok: %s users, %s rows", n_users, n_rows)
+
+
+@dp.callback_query(F.data == CB.WL_RUN, MainAdmin())
+async def v3_reconcile_now(call: types.CallbackQuery):
+    await call.answer("در حال بررسی…")
+    issues, n_users, n_rows = await asyncio.to_thread(reconcile_ledger)
+    text_, markup = _reconcile_report(issues, n_users, n_rows)
+    await call.bot.send_message(chat_id=call.from_user.id, text=text_, reply_markup=markup)
+
+
+def ledger_view(uid, limit=15):
+    with SessionLocal() as s:
+        u = s.get(User, uid)
+        bal = (u.balance if u else 0) or 0
+        rows = [
+            (t.created_iso, t.reason, t.delta, t.before, t.after, t.ref, t.by)
+            for t in s.query(WalletTx).filter(WalletTx.user_id == uid).order_by(WalletTx.id.desc()).limit(limit).all()
+        ]
+    out = f"📒 <b>دفتر کل کیف پول</b> <code>{uid}</code>\n💳 موجودی فعلی: {bal:,} تومان\n\n"
+    if not rows:
+        out += "هنوز ردیفی ثبت نشده."
+    for iso, reason, delta, before, after, ref, by in rows:
+        sign = "➕" if (delta or 0) > 0 else "➖"
+        out += (
+            f"{sign} {abs(delta or 0):,} | {WL_REASONS.get(reason, reason)}"
+            f"{(' #' + ref) if ref and ref != 'None' else ''}\n   {before:,} ← {after:,} | {iso}"
+            f"{(' | by ' + str(by)) if by else ''}\n"
+        )
+    last_after = rows[0][4] if rows else None
+    return out, bal, last_after
+
+
+@dp.callback_query(F.data.regexp(r"^v3_wl_\d+$"), Perm("users"))
+async def v3_ledger_show(call: types.CallbackQuery):
+    uid = int(call.data.split("_")[2])
+    await call.answer()
+    out, bal, last_after = ledger_view(uid)
+    b = InlineKeyboardButton
+    rows = []
+    if last_after is not None and last_after != bal and is_main(call.from_user.id):
+        rows.append([b(text="🛠 اصلاح مبنا (ثبت ردیف تعدیل)", callback_data=f"{CB.WL_FIX}{uid}")])
+    rows.append([b(text="🔙 مدیریت کاربر", callback_data=f"manage_user_{uid}")])
+    await edit_or_send(call, out[:4000], InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.regexp(r"^v3_wlfix_\d+$"), MainAdmin())
+async def v3_ledger_fix(call: types.CallbackQuery):
+    uid = int(call.data.split("_")[2])
+    with SessionLocal() as s:
+        u = s.get(User, uid)
+        last = s.query(WalletTx).filter(WalletTx.user_id == uid).order_by(WalletTx.id.desc()).first()
+        if u is None or last is None or last.after == (u.balance or 0):
+            await call.answer("مغایرتی وجود ندارد.", show_alert=True)
+            return
+        wlog(s, uid, last.after, u.balance or 0, "baseline_fix", "reconcile", call.from_user.id)
+        s.commit()
+    log_action(call.from_user.id, f"اصلاح مبنای دفتر کل کاربر {uid}")
+    await call.answer("ردیف تعدیل ثبت شد.", show_alert=True)
+    out, bal, last_after = ledger_view(uid)
+    await edit_or_send(call, out[:4000], InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 مدیریت کاربر", callback_data=f"manage_user_{uid}")]]))
+
+
+# ---------------------------------------------------------------------------
+# قرعه‌کشی ماهانه (ادمین تأیید می‌کند؛ جایزه اعتبار کیف پول و در دفتر کل ثبت می‌شود)
+# ---------------------------------------------------------------------------
+LOT_KINDS = {"ref": "برترین دعوت‌کننده‌های ۳۰ روز اخیر", "act": "مشتریان فعال (خرید ۳۰ روز اخیر)"}
+
+
+def lottery_candidates(kind):
+    """{آیدی: وزن}؛ فقط کاربران غیرمسدود."""
+    cutoff = today_iran() - timedelta(days=30)
+    with SessionLocal() as s:
+        ok = set(segment_user_ids(s, "all", promo=False))
+        if kind == "ref":
+            rows = (
+                s.query(User.referred_by, func.count(User.user_id))
+                .filter(User.referred_by.isnot(None), User.referral_rewarded.is_(True), User.joined_at >= cutoff.isoformat())
+                .group_by(User.referred_by)
+                .all()
+            )
+            pool = {uid: int(n) for uid, n in rows if uid in ok}
+        else:
+            c = (now_naive() - timedelta(days=30)).strftime(TS_FMT)
+            rows = (
+                s.query(Request.user_id)
+                .filter(Request.status == "answered", Request.req_type.in_(SALE_TYPES), Request.created_iso >= c)
+                .distinct()
+                .all()
+            )
+            pool = {uid: 1 for (uid,) in rows if uid in ok}
+    return pool
+
+
+def weighted_sample(weights, k):
+    """نمونه‌گیری وزنی بدون تکرار با منبع تصادفی امن."""
+    rnd = secrets.SystemRandom()
+    pool = {u: w for u, w in weights.items() if w > 0}
+    out = []
+    for _ in range(min(k, len(pool))):
+        total = sum(pool.values())
+        x, acc, pick = rnd.uniform(0, total), 0.0, None
+        for uid, w in pool.items():
+            acc += w
+            pick = uid
+            if x <= acc:
+                break
+        out.append(pick)
+        del pool[pick]
+    return out
+
+
+def _lot_key(kind):
+    return f"lot_{kind}_{jalali_today().strftime('%Y/%m')}"
+
+
+def mask_name(uid, first_name):
+    fn = (first_name or "").strip()
+    return f"{fn[0]}***" if fn else f"کاربر ***{str(uid)[-3:]}"
+
+
+@dp.callback_query(F.data.regexp(r"^v3_lot_(ref|act)$"), MainAdmin())
+async def v3_lottery_preview(call: types.CallbackQuery):
+    kind = call.data.split("_")[2]
+    pool = await asyncio.to_thread(lottery_candidates, kind)
+    n, prize = max(1, get_int("lottery_winners")), get_int("lottery_prize")
+    winners = min(n, len(pool))
+    await call.answer()
+    b = InlineKeyboardButton
+    out = (
+        f"🎰 <b>قرعه‌کشی: {LOT_KINDS[kind]}</b>\n\n👥 تعداد واجدین شرایط: {len(pool)}\n"
+        f"🏆 برندگان: {winners}\n🎁 جایزهٔ هر نفر: {prize:,} تومان اعتبار\n💰 هزینهٔ کل: {winners * prize:,} تومان\n"
+    )
+    rows = []
+    if not pool:
+        out += "\n⚠️ کسی واجد شرایط نیست."
+    elif get_setting(_lot_key(kind)) == "1":
+        out += "\n⚠️ برای این ماه قبلاً قرعه‌کشی همین نوع انجام شده است."
+        rows.append([b(text="باز هم انجام بده", callback_data=f"{CB.LOT_FORCE}{kind}")])
+    else:
+        rows.append([b(text="✅ انجام قرعه‌کشی و پرداخت جایزه", callback_data=f"{CB.LOT_GO}{kind}")])
+    rows.append([b(text="🔙 بازگشت", callback_data="spage_fin")])
+    await edit_or_send(call, out, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.regexp(r"^v3_(lotgo|lotf)_(ref|act)$"), MainAdmin())
+async def v3_lottery_run(call: types.CallbackQuery):
+    kind = call.data.split("_")[2]
+    prize, n = get_int("lottery_prize"), max(1, get_int("lottery_winners"))
+    pool = await asyncio.to_thread(lottery_candidates, kind)
+    winners = weighted_sample(pool, n)
+    if not winners or prize <= 0:
+        await call.answer("برنده‌ای انتخاب نشد.", show_alert=True)
+        return
+    names = {}
+    with SessionLocal() as s:
+        for uid in winners:
+            u = s.get(User, uid)
+            if u is None:
+                continue
+            b0 = u.balance or 0
+            u.balance = min(MAX_BALANCE, b0 + prize)
+            wlog(s, uid, b0, u.balance, "lottery", kind, call.from_user.id)
+            names[uid] = mask_name(uid, u.first_name)
+        s.commit()
+    set_setting(_lot_key(kind), "1")
+    log_action(call.from_user.id, f"قرعه‌کشی {kind}: {len(names)} برنده")
+    await call.answer("انجام شد.")
+    for uid in names:
+        await gsend(call.bot, uid, f"🎉 تبریک! تو برندهٔ قرعه‌کشی ماهانه شدی و {prize:,} تومان اعتبار به کیف پولت اضافه شد.")
+    summary = "\n".join(f"🏆 {nm}" for nm in names.values())
+    await edit_or_send(
+        call, f"✅ قرعه‌کشی انجام شد و جایزه واریز شد:\n\n{summary}",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت", callback_data="spage_fin")]]),
+    )
+    if get_bool("lottery_announce_on"):
+        try:
+            await call.bot.send_message(
+                chat_id=channel_chat_id(),
+                text=f"🎰 <b>برندگان قرعه‌کشی ماهانه</b> ({LOT_KINDS[kind]})\n\n{summary}\n\n🎁 جایزه: {prize:,} تومان اعتبار برای هر نفر\nماه بعد شانس تو هم هست 🙌",
+            )
+        except Exception as e:  # noqa: BLE001
+            logging.info("lottery announce failed: %s", e)
+
+
+async def v3_lottery_reminder(bot):
+    if not get_bool("lottery_remind_on"):
+        return
+    month = jalali_today().strftime("%Y/%m")
+    if jalali_today().day < get_int("lottery_day") or get_setting("lot_reminded") == month:
+        return
+    set_setting("lot_reminded", month)
+    b = InlineKeyboardButton
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [b(text="🎰 قرعه بین دعوت‌کننده‌های برتر", callback_data=f"{CB.LOT}ref")],
+            [b(text="🎰 قرعه بین مشتریان فعال", callback_data=f"{CB.LOT}act")],
+        ]
+    )
+    await gsend(bot, ADMIN_ID, "🎰 وقت قرعه‌کشی ماهانه است؛ جذابیت بالا، هزینهٔ کم. یکی را انتخاب کنید:", markup)
+
+
+# ---------------------------------------------------------------------------
+# ارسال هوشمند پیام همگانی: هر کاربر در ساعت معمول فعالیت خودش
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data == CB.SBC_GO, Perm("broadcast"))
+async def v3_smart_broadcast_start(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("bc_msg"):
+        await call.answer("درخواست منقضی شده است.", show_alert=True)
+        return
+    with SessionLocal() as s:
+        s.add(
+            SmartBroadcast(
+                from_chat=data["bc_chat"], message_id=data["bc_msg"], seg=data.get("bc_seg", "all"),
+                created_iso=iso_now_minute(), status="active", admin_id=call.from_user.id,
+            )
+        )
+        s.commit()
+    await call.answer()
+    await state.clear()
+    log_action(call.from_user.id, "ثبت ارسال هوشمند پیام همگانی")
+    await edit_or_send(call, "🕒 ارسال هوشمند ثبت شد؛ طی ۲۴ ساعت آینده هر کاربر در ساعت معمول فعالیت خودش پیام را می‌گیرد و گزارش در پایان می‌آید.")
+
+
+async def job_v3_smart_bc(bot):
+    now = now_naive()
+    with SessionLocal() as s:
+        active = [(x.id, x.from_chat, x.message_id, x.seg, x.created_iso, x.admin_id) for x in s.query(SmartBroadcast).filter(SmartBroadcast.status == "active").all()]
+    for bid, from_chat, mid, seg, created, admin_id in active:
+        try:
+            age_h = (now - datetime.strptime(created, TS_FMT)).total_seconds() / 3600
+        except (TypeError, ValueError):
+            age_h = 99
+        with SessionLocal() as s:
+            ids = segment_user_ids(s, seg)
+            sent = {r[0] for r in s.query(GrowthLog.user_id).filter(GrowthLog.kind == "sbc", GrowthLog.ref == str(bid)).all()}
+            hours = {u: h for u, h in s.query(User.user_id, User.active_hour).all()}
+        final = age_h >= 24
+        due = [u for u in ids if u not in sent and (final or (hours.get(u) if hours.get(u) is not None else 20) == now.hour)][:200]
+        for uid in due:
+            try:
+                await bot.copy_message(chat_id=uid, from_chat_id=from_chat, message_id=mid)
+            except TelegramForbiddenError:
+                mark_blocked(uid)
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+                continue  # در تیک بعدی دوباره تلاش می‌شود
+            except Exception as e:  # noqa: BLE001
+                logging.info("smart bc to %s failed: %s", uid, e)
+            with SessionLocal() as s:
+                glog_add(s, uid, "sbc", bid)
+                s.commit()
+            await asyncio.sleep(0.05)
+        if final and len(due) < 200:
+            with SessionLocal() as s:
+                x = s.get(SmartBroadcast, bid)
+                if x is not None:
+                    x.status = "done"
+                total = s.query(func.count(GrowthLog.id)).filter(GrowthLog.kind == "sbc", GrowthLog.ref == str(bid)).scalar() or 0
+                s.commit()
+            await gsend(bot, admin_id or ADMIN_ID, f"🕒 ارسال هوشمند #{bid} تمام شد؛ برای {total} نفر ارسال شد.")
+
+
+# ---------------------------------------------------------------------------
+# مرحلهٔ ترک قیف خرید (plan → checkout → pay → receipt)
+# ---------------------------------------------------------------------------
+FUNNEL_STEPS = ["plan", "checkout", "pay", "receipt"]
+FUNNEL_LABELS = {"plan": "انتخاب پلن", "checkout": "صفحهٔ سفارش", "pay": "صفحهٔ واریز", "receipt": "ارسال رسید"}
+
+
+def fstep(uid, step):
+    try:
+        with SessionLocal() as s:
+            ref = f"{step}:{today_iran().isoformat()}"
+            if not glog_has(s, uid, "fstep", ref):
+                glog_add(s, uid, "fstep", ref)
+                s.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("fstep failed: %s", e)
+
+
+def dropoff_report():
+    cutoff = (today_iran() - timedelta(days=30)).isoformat()
+    cutoff_ts = (now_naive() - timedelta(days=30)).strftime(TS_FMT)
+    best = {}
+    with SessionLocal() as s:
+        for uid, ref in s.query(GrowthLog.user_id, GrowthLog.ref).filter(GrowthLog.kind == "fstep", GrowthLog.created_iso >= cutoff).all():
+            step = (ref or "").split(":")[0]
+            if step in FUNNEL_STEPS:
+                best[uid] = max(best.get(uid, 0), FUNNEL_STEPS.index(step))
+        buyers = {
+            r[0]
+            for r in s.query(Request.user_id).filter(Request.req_type.in_(SALE_TYPES), Request.created_iso >= cutoff_ts).all()
+        }
+    out = "📉 <b>گزارش ریزش قیف خرید (۳۰ روز اخیر)</b>\n<i>از زمان فعال‌شدن این نسخه ثبت می‌شود.</i>\n\n"
+    if not best:
+        return out + "هنوز داده‌ای ثبت نشده است."
+    for i, step in enumerate(FUNNEL_STEPS):
+        reached = sum(1 for v in best.values() if v >= i)
+        left = sum(1 for u, v in best.items() if v == i and u not in buyers)
+        out += f"• {FUNNEL_LABELS[step]}: {reached} نفر رسیدند | {left} نفر همین‌جا رها کردند\n"
+    out += f"\n✅ خریداران: {sum(1 for u in best if u in buyers)} نفر"
+    return out
+
+
+@dp.callback_query(F.data == CB.DROPOFF, MainAdmin())
+async def v3_dropoff_cb(call: types.CallbackQuery):
+    await call.answer()
+    await call.bot.send_message(chat_id=call.from_user.id, text=dropoff_report())
+
+
+@dp.message(Command("dropoff"), MainAdmin())
+async def v3_dropoff_cmd(message: types.Message):
+    await message.answer(dropoff_report())
+
+
+# ---------------------------------------------------------------------------
+# نسخه‌گذاری متن‌ها (بازگردانی متن قبلی)
+# ---------------------------------------------------------------------------
+def v3_save_version(key, old, by):
+    if not old:
+        return
+    try:
+        with SessionLocal() as s:
+            last = s.query(SettingVersion).filter(SettingVersion.key == key).order_by(SettingVersion.id.desc()).first()
+            if last is not None and last.value == old:
+                return
+            s.add(SettingVersion(key=key, value=old, created_iso=iso_now_minute(), by=by))
+            s.flush()
+            ids = [i for (i,) in s.query(SettingVersion.id).filter(SettingVersion.key == key).order_by(SettingVersion.id.desc()).all()]
+            if len(ids) > 8:
+                s.query(SettingVersion).filter(SettingVersion.id.in_(ids[8:])).delete(synchronize_session=False)
+            s.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("save version failed: %s", e)
+
+
+@dp.callback_query(F.data.regexp(r"^v3_sv_[a-z0-9_]+$"), MainAdmin())
+async def v3_versions_list(call: types.CallbackQuery):
+    key = call.data[len(CB.SV_LIST):]
+    meta = SETTINGS.get(key)
+    if meta is None or meta["type"] != "text":
+        await call.answer()
+        return
+    await call.answer()
+    with SessionLocal() as s:
+        rows = [(v.id, v.created_iso, v.value) for v in s.query(SettingVersion).filter(SettingVersion.key == key).order_by(SettingVersion.id.desc()).limit(8).all()]
+    b = InlineKeyboardButton
+    out = f"🕘 <b>نسخه‌های قبلی: {meta['label']}</b>\n\n"
+    keyboard = []
+    for vid, iso, val in rows:
+        snippet = (val or "").replace("\n", " ")
+        out += f"• {iso}: {esc(snippet[:60])}{'…' if len(snippet) > 60 else ''}\n"
+        keyboard.append([b(text=f"↩️ برگردان به {iso}", callback_data=f"{CB.SV_RESTORE}{vid}")])
+    if not rows:
+        out += "نسخهٔ قبلی ذخیره نشده است."
+    if key in DEFAULTS and DEFAULTS[key]:
+        keyboard.append([b(text="♻️ برگشت به متن پیش‌فرض", callback_data=f"{CB.SV_DEFAULT}{key}")])
+    keyboard.append([b(text="🔙 بازگشت", callback_data=f"spage_{meta['page']}")])
+    await edit_or_send(call, out[:4000], InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+@dp.callback_query(F.data.regexp(r"^v3_svr_\d+$"), MainAdmin())
+async def v3_version_restore(call: types.CallbackQuery):
+    vid = int(call.data.split("_")[2])
+    with SessionLocal() as s:
+        v = s.get(SettingVersion, vid)
+        if v is None or v.key not in SETTINGS:
+            await call.answer("یافت نشد.", show_alert=True)
+            return
+        key, value = v.key, v.value
+    v3_save_version(key, get_setting(key), call.from_user.id)  # نسخهٔ فعلی هم برای برگشت پشتیبان می‌شود
+    set_setting(key, value)
+    log_action(call.from_user.id, f"بازگردانی نسخهٔ قبلی {key}")
+    await call.answer("✅ بازگردانی شد.", show_alert=True)
+    out, markup = render_settings_page(SETTINGS[key]["page"])
+    await edit_or_send(call, out, markup)
+
+
+@dp.callback_query(F.data.regexp(r"^v3_svd_[a-z0-9_]+$"), MainAdmin())
+async def v3_version_default(call: types.CallbackQuery):
+    key = call.data[len(CB.SV_DEFAULT):]
+    if key not in SETTINGS or key not in DEFAULTS:
+        await call.answer()
+        return
+    v3_save_version(key, get_setting(key), call.from_user.id)
+    set_setting(key, DEFAULTS[key])
+    log_action(call.from_user.id, f"بازگشت به پیش‌فرض {key}")
+    await call.answer("✅ متن پیش‌فرض برگشت.", show_alert=True)
+    out, markup = render_settings_page(SETTINGS[key]["page"])
+    await edit_or_send(call, out, markup)
+
+
+# ---------------------------------------------------------------------------
+# دکمه‌ها و توضیحات اضافهٔ صفحه‌های تنظیمات جدید
+# ---------------------------------------------------------------------------
+def v3_page_extras(page):
+    """(متن اضافه, ردیف‌های دکمه) برای صفحهٔ تنظیمات."""
+    b = InlineKeyboardButton
+    if page == "trust":
+        st = social_stats()
+        text_ = (
+            f"\n📊 داده فعلی: {st['customers']} مشتری فعال | {st['n_rate']} امتیاز | {st['n_deliv']} تحویل\n"
+            f"پیش‌نمایش خط آمار: {social_line() or '— (هنوز به حداقل نمونه نرسیده)'}\n"
+        )
+        return text_, [
+            [b(text="💬 نظرهای در انتظار تأیید", callback_data=CB.RV_PENDING)],
+            [b(text="📤 ارسال تاریخچهٔ وضعیت به کانال", callback_data=CB.STATUS_POST)],
+            [b(text="📉 گزارش ریزش قیف خرید", callback_data=CB.DROPOFF)],
+        ]
+    if page == "supp2":
+        return "\nℹ️ پاسخ‌های آماده زیر هر تیکت برای ادمین به‌صورت دکمه نمایش داده می‌شود.\n", [
+            [b(text="📣 ارسال آدرس‌های جایگزین به همهٔ کاربران", callback_data=CB.ALT_ASK)]
+        ]
+    if page == "fin":
+        return "\nℹ️ جایزهٔ قرعه‌کشی به‌صورت اعتبار کیف پول و با ثبت در دفتر کل پرداخت می‌شود.\n", [
+            [b(text="🧮 تطبیق کیف پول‌ها با دفتر کل (الان)", callback_data=CB.WL_RUN)],
+            [b(text="🎰 قرعه‌کشی: دعوت‌کننده‌های برتر", callback_data=f"{CB.LOT}ref")],
+            [b(text="🎰 قرعه‌کشی: مشتریان فعال", callback_data=f"{CB.LOT}act")],
+        ]
+    if page == "auto":
+        ch, link = (get_setting("backup_channel") or "").strip(), (get_setting("backup_channel_link") or "").strip()
+        text_ = "\n📦 کانال بکاپ فعلی: " + (esc(ch) if ch else "— (ثبت نشده)")
+        if link:
+            text_ += f"\n🔗 لینک: {esc(link)}"
+        text_ += "\nℹ️ کانال خصوصی: ربات را ادمین کانال کنید تا ثبت خودکار پیشنهاد شود، یا یک پیام از کانال فوروارد کنید.\n"
+        return text_, []
+    if page == "pay2":
+        return "\nℹ️ ساعت کاری فقط برای نمایش وعدهٔ پاسخ و «پیام خودکار شب» استفاده می‌شود.\n", []
+    return "", []
+
+
+# ---------------------------------------------------------------------------
+# زمان‌بندی: پیگیری‌ها، ارسال هوشمند، پیشنهاد روزانه
+# ---------------------------------------------------------------------------
+_v3_last = 0.0
+_v3_busy = False
+
+
+async def v3_daily(bot):
+    now = now_iran()
+    if now.hour < 11 or get_setting("last_v3daily") == today_iran().isoformat():
+        return
+    set_setting("last_v3daily", today_iran().isoformat())
+    for fn in (job_v3_downsell, v3_lottery_reminder):
+        try:
+            await fn(bot)
+        except Exception as e:  # noqa: BLE001
+            logging.error("v3 daily %s failed: %s", fn.__name__, e)
+            await report_error(bot, f"v3: {fn.__name__}", e)
+
+
+async def job_v3_tick(bot):
+    global _v3_last, _v3_busy
+    if _v3_busy or time.time() - _v3_last < 240:
+        return
+    _v3_busy = True
+    _v3_last = time.time()
+    try:
+        for fn in (job_v3_followups, job_v3_smart_bc, v3_daily):
+            try:
+                await fn(bot)
+            except Exception as e:  # noqa: BLE001
+                logging.error("v3 tick %s failed: %s", fn.__name__, e)
+                await report_error(bot, f"v3: {fn.__name__}", e)
+    finally:
+        _v3_busy = False
+
+
+def v3_pay_holder_line(holder):
+    """خط «به نام …» صفحهٔ پرداخت؛ با تنظیم روشن، یادداشت اطمینان‌بخش جایگزین می‌شود."""
+    if get_bool("paynote_on"):
+        t = (get_setting("paynote_text") or "").strip() or DEFAULTS["paynote_text"]
+        return esc(t.replace("{holder}", holder or ""))
+    return f"به نام: {esc(holder or '')}"
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# کانال بکاپ خصوصی: ثبت خودکار وقتی ربات ادمین کانال می‌شود، یا با فوروارد پیام کانال
+# ---------------------------------------------------------------------------
+DEFAULTS.update({"backup_channel_link": ""})
+SETTINGS.update(
+    {
+        "backup_channel_link": dict(
+            page="auto", type="text", label="لینک کانال بکاپ (برای یادآوری شما؛ هنگام ثبت خودکار پر می‌شود)"
+        ),
+    }
+)
+
+
+def forwarded_channel_id(message):
+    """آیدی عددی کانالی که پیام از آن فوروارد شده؛ وگرنه None."""
+    origin = getattr(message, "forward_origin", None)
+    chat = getattr(origin, "chat", None) if origin is not None else None
+    if chat is None:
+        chat = getattr(message, "forward_from_chat", None)
+    if chat is not None and getattr(chat, "type", "") == "channel":
+        return chat.id
+    return None
+
+
+async def register_backup_channel(bot, chat_id):
+    """کانال را به‌عنوان مقصد بکاپ ثبت می‌کند: دسترسی ادمین را می‌سنجد، لینک را ذخیره می‌کند و بکاپ آزمایشی می‌فرستد.
+    (موفق؟, متن گزارش) را برمی‌گرداند."""
+    try:
+        chat = await bot.get_chat(chat_id)
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        if member.status not in ("administrator", "creator"):
+            return False, "ربات در این کانال ادمین نیست."
+    except Exception as e:  # noqa: BLE001
+        return False, f"دسترسی به کانال ممکن نشد: {err_text(e)}"
+    link = getattr(chat, "invite_link", None) or (f"https://t.me/{chat.username}" if getattr(chat, "username", None) else "")
+    if not link:
+        try:  # لینک جدید می‌سازد (لینک فعلی کانال باطل نمی‌شود)
+            link = (await bot.create_chat_invite_link(chat_id, name="Swan backup")).invite_link
+        except Exception as e:  # noqa: BLE001
+            logging.info("backup channel invite link not available: %s", e)
+            link = ""
+    set_setting("backup_channel", str(chat_id))
+    if link:
+        set_setting("backup_channel_link", link)
+    title = esc(getattr(chat, "title", "") or str(chat_id))
+    try:
+        await send_backup(bot, chat_id, f"🧰 بکاپ آزمایشی - {get_current_jalali()}")
+    except Exception as e:  # noqa: BLE001
+        return False, f"کانال «{title}» ثبت شد ولی ارسال بکاپ ناموفق بود: {err_text(e)}\nمجوز «ارسال پیام» و «ارسال فایل» را برای ربات باز کنید."
+    return True, f"✅ کانال «{title}» برای بکاپ ثبت شد و بکاپ آزمایشی ارسال شد." + (f"\n🔗 {esc(link)}" if link else "")
+
+
+async def _backup_channel_after_save(bot, message, value):
+    """بعد از ذخیرهٔ دستی کانال بکاپ: دسترسی را می‌سنجد و بکاپ آزمایشی می‌فرستد."""
+    try:
+        ref = chat_ref(value)
+        chat_id = ref if isinstance(ref, int) else (await bot.get_chat(ref)).id
+    except Exception as e:  # noqa: BLE001
+        await message.answer(f"⚠️ ذخیره شد ولی کانال پیدا نشد: {err_text(e)}")
+        return
+    ok, report = await register_backup_channel(bot, chat_id)
+    await message.answer(report if ok else "⚠️ " + report)
+
+
+@dp.my_chat_member()
+async def v3_bot_chat_member(event: types.ChatMemberUpdated):
+    """وقتی ادمین اصلی ربات را در کانالی ادمین می‌کند، ثبت آن به‌عنوان کانال بکاپ پیشنهاد می‌شود."""
+    try:
+        if event.chat.type != "channel":
+            return
+        if event.new_chat_member.status != "administrator" or event.old_chat_member.status == "administrator":
+            return
+        if not (event.from_user and is_main(event.from_user.id)):
+            return  # فقط وقتی خود ادمین اصلی ربات را اضافه کرده باشد
+        b = InlineKeyboardButton
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [b(text="✅ ثبت به‌عنوان کانال بکاپ", callback_data=f"{CB.BK_SET}{event.chat.id}")],
+                [b(text="❌ نه", callback_data=CB.BK_SKIP)],
+            ]
+        )
+        await event.bot.send_message(
+            chat_id=event.from_user.id,
+            text=f"🤖 من در کانال «{esc(event.chat.title or '')}» ادمین شدم.\nبکاپ‌های شبانه و دستی اینجا هم فرستاده شوند؟",
+            reply_markup=markup,
+        )
+    except Exception as e:  # noqa: BLE001
+        logging.warning("my_chat_member handler failed: %s", e)
+
+
+@dp.callback_query(F.data.regexp(r"^v3_bkch_-?\d+$"), MainAdmin())
+async def v3_backup_channel_set(call: types.CallbackQuery):
+    chat_id = int(call.data[len(CB.BK_SET):])
+    await call.answer("در حال ثبت…")
+    ok, report = await register_backup_channel(call.bot, chat_id)
+    if ok:
+        log_action(call.from_user.id, f"ثبت کانال بکاپ {chat_id}")
+    await edit_or_send(call, report if ok else "⚠️ " + report)
+
+
+@dp.callback_query(F.data == CB.BK_SKIP, MainAdmin())
+async def v3_backup_channel_skip(call: types.CallbackQuery):
+    await call.answer()
+    await edit_or_send(call, "باشه؛ ثبت نشد. هر وقت خواستید از تنظیمات ← «یادآوری، گزارش و نظرسنجی» انجام دهید.")
+
+
 JOBS = [
     ("backup", 3, 0, job_backup),
+    ("reconcile", 3, 30, job_reconcile),
     ("cleanup", 4, 0, job_cleanup),
     ("weekly", 9, 0, job_weekly_report),
     ("reminders", 10, 0, job_reminders),
@@ -10026,6 +12687,7 @@ async def scheduler(bot):
             await job_pending_reminder(bot)
             spawn(job_usage_alerts(bot))
             spawn(job_growth_tick(bot))
+            spawn(job_v3_tick(bot))
         except Exception as e:  # noqa: BLE001
             logging.error("scheduler error: %s", e)
             await report_error(bot, "زمان‌بند اصلی", e)
